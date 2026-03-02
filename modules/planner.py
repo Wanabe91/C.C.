@@ -1,43 +1,51 @@
 import json
+from datetime import datetime
 from modules.llm_client import LLMClient
 from modules.memory import Memory
-from datetime import datetime
 
 TOOLS = [
-    {"type":"function","function":{
-        "name":"get_current_time",
-        "description":"Текущие дата и время",
-        "parameters":{"type":"object","properties":{},"required":[]}
+    {"type": "function", "function": {
+        "name": "get_current_time",
+        "description": "Текущие дата и время",
+        "parameters": {"type": "object", "properties": {}, "required": []}
     }},
-    {"type":"function","function":{
-        "name":"remember",
-        "description":"Запомнить важный факт",
-        "parameters":{"type":"object","properties":{
-            "content":{"type":"string"}
-        },"required":["content"]}
-    }},
-    {"type":"function","function":{
-        "name":"recall",
-        "description":"Вспомнить информацию из памяти",
-        "parameters":{"type":"object","properties":{
-            "query":{"type":"string"}
-        },"required":["query"]}
-    }},
-    {"type": "function",
-    "function": {
-        "name": "update_profile",
-        "description": "Обновить профиль пользователя когда он сообщает о себе что-то важное",
+    {"type": "function", "function": {
+        "name": "remember",
+        "description": "Запомнить важный факт",
         "parameters": {
             "type": "object",
             "properties": {
-                "updates": {
-                    "type": "object",
-                    "description": 'Например: {"name":"Алексей"} или {"preferences":{"кофе":"американо"}} или {"goals":["научиться плавать"]}'
-                },
-                "required": ["updates"]
-            }
+                "content": {"type": "string"}
+            },
+            "required": ["content"]
         }
-    }}
+    }},
+    {"type": "function", "function": {
+        "name": "recall",
+        "description": "Вспомнить информацию из памяти",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"}
+            },
+            "required": ["query"]
+        }
+    }},
+    {"type": "function",
+     "function": {
+         "name": "update_profile",
+         "description": "Обновить профиль пользователя когда он сообщает о себе что-то важное",
+         "parameters": {
+             "type": "object",
+             "properties": {
+                 "updates": {
+                     "type": "object",
+                     "description": 'Например: {"name":"Алексей"} или {"preferences":{"кофе":"американо"}} или {"goals":["научиться плавать"]}'
+                 }
+             },
+             "required": ["updates"]
+         }
+     }}
 ]
 
 class Planner:
@@ -48,50 +56,66 @@ class Planner:
 
     async def run(self, user_input: str) -> str:
         history = self.memory.get_history()
+        history.append({"role": "user", "content": user_input})
         self.memory.add("user", user_input)
 
         for _ in range(self.max_steps):
-            msg = await self.llm.chat_with_tools(user_input, TOOLS, history)
+            msg = await self.llm.chat_with_tools(history, TOOLS)
             if not msg.get("tool_calls"):
-                answer = msg.get("content","").strip()
+                answer = (msg.get("content") or "").strip()
+                if not answer:
+                    answer = "Пустой ответ от модели."
                 self.memory.add("assistant", answer)
+                self.memory.after_turn(user_input, answer)
                 return answer
 
-            tool_results = []
+            history.append({
+                "role": "assistant",
+                "content": msg.get("content"),
+                "tool_calls": msg["tool_calls"],
+            })
+
             for call in msg["tool_calls"]:
-                result = await self._execute(
-                    call["function"]["name"],
-                    json.loads(call["function"].get("arguments","{}"))
-                )
-                tool_results.append({"tool_call_id":call["id"],
-                                     "role":"tool","content":str(result)})
-            history = history + [
-                {"role":"assistant","content":None,
-                 "tool_calls":msg["tool_calls"]},
-                *tool_results
-            ]
-        return "Не смог выполнить задачу."
+                try:
+                    arguments = json.loads(call["function"].get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    arguments = {}
+
+                result = await self._execute(call["function"]["name"], arguments)
+                if isinstance(result, (dict, list)):
+                    content = json.dumps(result, ensure_ascii=False)
+                else:
+                    content = str(result)
+
+                history.append({
+                    "tool_call_id": call["id"],
+                    "role": "tool",
+                    "content": content,
+                })
+
+        answer = "Не смог выполнить задачу."
+        self.memory.add("assistant", answer)
+        self.memory.after_turn(user_input, answer)
+        return answer
 
     async def _execute(self, name, args):
         if name == "get_current_time":
             return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if name == "remember":
-            self.memory.save("fact", args["content"]); return "Запомнено."
+            content = args.get("content", "").strip()
+            if not content:
+                return "Пустое содержимое для памяти."
+            self.memory.save(content, role="fact")
+            return "Запомнено."
         if name == "recall":
-            return self.memory.recall(args["query"])
+            query = args.get("query", "").strip()
+            if not query:
+                return []
+            return self.memory.recall(query)
         if name == "update_profile":
-            self.memory.update_profile(args["updates"])
+            updates = args.get("updates", {})
+            if not isinstance(updates, dict):
+                return "Некорректные данные профиля."
+            self.memory.update_profile(updates)
             return "Профиль обновлён."
         return f"Неизвестный инструмент: {name}"
----
-
-## 🗺 Дорожная карта
-
-| Фаза | Что делать |
-|---|---|
-| **1. Скелет** | Запустить text mode + подключить свой LLM сервер |
-| **2. Голос** | Добавить Whisper STT + pyttsx3 TTS, запустить voice mode |
-| **3. Память** | Заменить LIKE-поиск в memory.py на embedding-поиск (SQLite+FAISS) |
-| **4. Зрение** | Подключить YOLOv8, протестировать vision mode |
-| **5. Инструменты** | Реализовать web_tool (DuckDuckGo), calendar_tool (Google API) |
-| **6. Продакшн** | Wake word, демон-сервис, GUI (tkinter/web), многопоточность |

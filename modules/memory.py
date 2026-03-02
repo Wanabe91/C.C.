@@ -86,15 +86,31 @@ class EpisodicMemory:
     def count(self): return self._col.count()
 
 
+class NullEpisodicMemory:
+    def save(self, content, role="dialog", tags=None):
+        return None
+
+    def recall(self, query, top_k=5, role_filter=None):
+        return []
+
+    def count(self):
+        return 0
+
+
 # ═══════════════════════════════════════════════
 # СЛОЙ 3 — Профиль личности (JSON, всегда в промпте)
 # ═══════════════════════════════════════════════
 class PersonalityProfile:
     def __init__(self, path="data/profile.json"):
         self.path = path
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        self._d = json.load(open(path, encoding="utf-8")) \
-                  if os.path.exists(path) else dict(DEFAULT_PROFILE)
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                self._d = json.load(f)
+        else:
+            self._d = dict(DEFAULT_PROFILE)
 
     def _save(self):
         with open(self.path, "w", encoding="utf-8") as f:
@@ -145,11 +161,22 @@ class PersonalityProfile:
 class Memory:
     def __init__(self, cfg=None):
         cfg = cfg or {}
+        episodic_path = cfg.get("episodic_db") or cfg.get("long_term_db") or "data/episodic"
+        if episodic_path.endswith(".db"):
+            episodic_path = os.path.join(os.path.dirname(episodic_path) or "data", "episodic")
+
         self.working  = WorkingMemory(limit=cfg.get("short_term_limit", 20))
-        self.episodic = EpisodicMemory(
-            db_path=cfg.get("episodic_db", "data/episodic"),
-            embed_model=cfg.get("embed_model"),
-        )
+        if cfg.get("episodic_enabled", True):
+            try:
+                self.episodic = EpisodicMemory(
+                    db_path=episodic_path,
+                    embed_model=cfg.get("embed_model"),
+                )
+            except Exception as exc:
+                logger.warning("Episodic memory disabled: %s", exc)
+                self.episodic = NullEpisodicMemory()
+        else:
+            self.episodic = NullEpisodicMemory()
         self.profile  = PersonalityProfile(
             path=cfg.get("profile_path", "data/profile.json")
         )
