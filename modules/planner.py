@@ -23,6 +23,21 @@ TOOLS = [
             "query":{"type":"string"}
         },"required":["query"]}
     }},
+    {"type": "function",
+    "function": {
+        "name": "update_profile",
+        "description": "Обновить профиль пользователя когда он сообщает о себе что-то важное",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "updates": {
+                    "type": "object",
+                    "description": 'Например: {"name":"Алексей"} или {"preferences":{"кофе":"американо"}} или {"goals":["научиться плавать"]}'
+                },
+                "required": ["updates"]
+            }
+        }
+    }}
 ]
 
 class Planner:
@@ -64,9 +79,10 @@ class Planner:
             self.memory.save("fact", args["content"]); return "Запомнено."
         if name == "recall":
             return self.memory.recall(args["query"])
+        if name == "update_profile":
+            self.memory.update_profile(args["updates"])
+            return "Профиль обновлён."
         return f"Неизвестный инструмент: {name}"
-```
-
 ---
 
 ## 🗺 Дорожная карта
@@ -79,7 +95,3 @@ class Planner:
 | **4. Зрение** | Подключить YOLOv8, протестировать vision mode |
 | **5. Инструменты** | Реализовать web_tool (DuckDuckGo), calendar_tool (Google API) |
 | **6. Продакшн** | Wake word, демон-сервис, GUI (tkinter/web), многопоточность |
-
-## Зависимости для старта
-```
-pip install httpx pyyaml openai-whisper pyttsx3 ultralytics opencv-python
