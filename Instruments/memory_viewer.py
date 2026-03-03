@@ -1,7 +1,6 @@
 """
 LLM Memory Viewer
 Запуск: streamlit run memory_viewer.py
-Зависимости: pip install streamlit chromadb pandas numpy scikit-learn plotly
 """
 
 import streamlit as st
