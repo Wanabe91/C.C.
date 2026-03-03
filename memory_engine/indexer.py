@@ -40,6 +40,10 @@ async def run_indexer(stop_event: asyncio.Event) -> None:
 
         try:
             collection = get_collection()
+            if collection is None:
+                mark_outbox_done(item["id"])
+                recompute_vector_watermark()
+                continue
             vector = embed(fact.content)
             metadata = {
                 "fact_id": fact.id,

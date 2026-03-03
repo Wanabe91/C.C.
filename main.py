@@ -1,14 +1,18 @@
 import argparse
 import asyncio
-
 import yaml
+from memory_engine.hf_auth import configure_huggingface_auth
 
-# Optional modules are not included in this repository.
+
+configure_huggingface_auth()
+
 # from utils.event_bus import EventBus
 # from modules.stt import SpeechRecognizer
 # from modules.tts import TextToSpeech
 # from modules.vision import VisionModule
 from modules.planner import Planner
+
+
 
 
 class PersonalAI:

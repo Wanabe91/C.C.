@@ -5,6 +5,7 @@ from typing import Any
 import httpx
 
 from .config import get_config
+from .http_client import post
 
 
 class LMStudioError(Exception):
@@ -14,10 +15,13 @@ class LMStudioError(Exception):
         self.body = body
 
 
+_JSON_RESPONSE_FORMAT_SUPPORTED: bool | None = None
+
+
 def _post_chat(payload: dict[str, Any]) -> str:
     config = get_config()
     try:
-        response = httpx.post(
+        response = post(
             f"{config.LLM_BASE_URL}/chat/completions",
             json=payload,
             headers={"Content-Type": "application/json"},
@@ -40,6 +44,8 @@ def _post_chat(payload: dict[str, Any]) -> str:
 
 
 def llm_call(system: str, user: str, schema: dict[str, Any] | None = None) -> str:
+    global _JSON_RESPONSE_FORMAT_SUPPORTED
+
     config = get_config()
     messages = []
     if system.strip():
@@ -58,30 +64,37 @@ def llm_call(system: str, user: str, schema: dict[str, Any] | None = None) -> st
                 f"LM Studio request failed with HTTP {exc.status_code}: {exc.body}"
             ) from exc
 
-    first_payload = dict(payload)
-    first_payload["response_format"] = {"type": "json_object"}
-    try:
-        return _post_chat(first_payload)
-    except LMStudioError:
-        repair_messages = list(messages)
-        repair_messages[-1] = {
-            "role": "user",
-            "content": (
-                "Return valid JSON only.\n"
-                f"Required shape: {schema}\n\n"
-                f"{user}"
-            ),
-        }
-        repair_payload = {
-            "model": config.LLM_MODEL,
-            "messages": repair_messages,
-            "temperature": 0,
-        }
+    if _JSON_RESPONSE_FORMAT_SUPPORTED is not False:
+        first_payload = dict(payload)
+        first_payload["response_format"] = {"type": "json_object"}
         try:
-            return _post_chat(repair_payload)
-        except LMStudioError as retry_exc:
-            raise RuntimeError(
-                f"LM Studio request failed with HTTP {retry_exc.status_code}: {retry_exc.body}"
-            ) from retry_exc
-    except RuntimeError:
-        raise
+            response = _post_chat(first_payload)
+            _JSON_RESPONSE_FORMAT_SUPPORTED = True
+            return response
+        except LMStudioError as exc:
+            if exc.status_code != 400:
+                raise RuntimeError(
+                    f"LM Studio request failed with HTTP {exc.status_code}: {exc.body}"
+                ) from exc
+            _JSON_RESPONSE_FORMAT_SUPPORTED = False
+
+    repair_messages = list(messages)
+    repair_messages[-1] = {
+        "role": "user",
+        "content": (
+            "Return valid JSON only.\n"
+            f"Required shape: {schema}\n\n"
+            f"{user}"
+        ),
+    }
+    repair_payload = {
+        "model": config.LLM_MODEL,
+        "messages": repair_messages,
+        "temperature": 0,
+    }
+    try:
+        return _post_chat(repair_payload)
+    except LMStudioError as retry_exc:
+        raise RuntimeError(
+            f"LM Studio request failed with HTTP {retry_exc.status_code}: {retry_exc.body}"
+        ) from retry_exc

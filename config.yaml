@@ -2,7 +2,7 @@ llm:
   base_url: "http://localhost:1234/v1"   # порт LM Studio по умолчанию
   model: "local-model"                    # LM Studio игнорирует это поле, но оно обязательно
   api_key: ""                             # не нужен
-  system_prompt: "Ты персональный ИИ-ассистент. Отвечай кратко на русском."
+  system_prompt: "Ты персональный ИИ-ассистент. Твои ответы всегда сдержаны и жестко логичны."
   max_tokens: 1024
   temperature: 0.7
 
@@ -16,16 +16,18 @@ tts:
   engine: "pyttsx3"   # pyttsx3 | edge-tts
 
 vision:
-  enabled: true
+  enabled: false
   camera_index: 0
   frame_interval: 30
   model: "yolov8n"
 
 memory:
   short_term_limit: 20
-  episodic_enabled: false
+  episodic_enabled: true
   episodic_db: "data/episodic"
   profile_path: "data/profile.json"
+  embed_backend: "lmstudio"
+  embed_model: "text-embedding-sts-multilingual-mpnet-base-v2"
 
 planner:
   max_steps: 10

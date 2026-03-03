@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from .config import get_config
@@ -98,8 +99,62 @@ def _planner_user_prompt(ctx: ContextSnapshot, goal: str) -> str:
     )
 
 
+def _find_json_fragment(raw: str) -> str | None:
+    start = -1
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+
+    for index, char in enumerate(raw):
+        if start < 0:
+            if char not in "{[":
+                continue
+            start = index
+            stack.append("}" if char == "{" else "]")
+            continue
+
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+            continue
+
+        if char in "{[":
+            stack.append("}" if char == "{" else "]")
+            continue
+
+        if char in "}]":
+            if not stack or char != stack[-1]:
+                return None
+            stack.pop()
+            if not stack:
+                return raw[start : index + 1]
+
+    return None
+
+
+def _normalize_planner_output(raw: str) -> str:
+    cleaned = re.sub(r"<think>.*?</think>\s*", "", raw, flags=re.IGNORECASE | re.DOTALL).strip()
+    for candidate in (cleaned, raw.strip()):
+        if not candidate:
+            continue
+        if candidate[:1] in "{[":
+            return candidate
+        fragment = _find_json_fragment(candidate)
+        if fragment is not None:
+            return fragment
+    raise ValueError("Planner output did not contain a JSON object.")
+
+
 def _parse_steps(raw: str) -> list[PlanStep]:
-    payload = json.loads(raw)
+    payload = json.loads(_normalize_planner_output(raw))
     raw_steps = payload.get("steps")
     if not isinstance(raw_steps, list):
         raise ValueError("Planner output did not include a steps array.")
@@ -127,7 +182,11 @@ def _parse_steps(raw: str) -> list[PlanStep]:
 
 
 def _fallback_plan(goal: str) -> list[PlanStep]:
-    message = "I need a bit more detail to continue." if not goal.strip() else f"I can help with: {goal}"
+    message = (
+        "I need a bit more detail to continue."
+        if not goal.strip()
+        else "I couldn't produce a structured response for that request. Please try again."
+    )
     return [
         PlanStep(
             action="respond",

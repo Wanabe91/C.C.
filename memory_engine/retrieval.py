@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import logging
 import re
 from threading import Lock
 from typing import Any
+import warnings
 
 from .config import get_config
 from .db import (
@@ -19,6 +21,9 @@ from .working_memory import working_memory
 
 _collection = None
 _collection_lock = Lock()
+_vector_store_disabled = False
+_vector_store_disable_reason = ""
+logger = logging.getLogger(__name__)
 
 
 class MemoryEmbeddingFunction:
@@ -61,26 +66,57 @@ class MemoryEmbeddingFunction:
             raise TypeError("Embedding function config must be a dict.")
 
 
+def _disable_vector_store(exc: Exception) -> None:
+    global _vector_store_disabled, _vector_store_disable_reason
+
+    if _vector_store_disabled:
+        return
+    _vector_store_disabled = True
+    _vector_store_disable_reason = str(exc).strip() or exc.__class__.__name__
+    logger.info(
+        "Vector store disabled; continuing without ChromaDB-backed retrieval. Reason: %s",
+        _vector_store_disable_reason,
+    )
+
+
+def vector_store_is_available() -> bool:
+    return get_collection() is not None
+
+
 def get_collection():
     global _collection
+    if _vector_store_disabled:
+        return None
     if _collection is not None:
         return _collection
     with _collection_lock:
+        if _vector_store_disabled:
+            return None
         if _collection is None:
             config = get_config()
             config.ensure_directories()
-            import chromadb
-            from chromadb.config import Settings
+            try:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        message="Core Pydantic V1 functionality isn't compatible with Python 3.14 or greater.",
+                        category=UserWarning,
+                    )
+                    import chromadb
+                    from chromadb.config import Settings
 
-            client = chromadb.PersistentClient(
-                path=str(config.CHROMA_PATH),
-                settings=Settings(anonymized_telemetry=False),
-            )
-            _collection = client.get_or_create_collection(
-                name="facts",
-                metadata={"hnsw:space": "cosine"},
-                embedding_function=MemoryEmbeddingFunction(),
-            )
+                client = chromadb.PersistentClient(
+                    path=str(config.CHROMA_PATH),
+                    settings=Settings(anonymized_telemetry=False),
+                )
+                _collection = client.get_or_create_collection(
+                    name="facts",
+                    metadata={"hnsw:space": "cosine"},
+                    embedding_function=MemoryEmbeddingFunction(),
+                )
+            except Exception as exc:
+                _disable_vector_store(exc)
+                return None
     return _collection
 
 
@@ -117,6 +153,8 @@ def chroma_search(query: str, n: int | None = None, vector_watermark: int = 0) -
     if not query.strip():
         return []
     collection = get_collection()
+    if collection is None:
+        return []
     results = collection.query(
         query_texts=[query],
         n_results=resolved_n,

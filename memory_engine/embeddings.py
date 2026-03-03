@@ -2,22 +2,24 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-import httpx
 from sentence_transformers import SentenceTransformer
 
 from .config import get_config
+from .hf_auth import configure_huggingface_auth
+from .http_client import post
 
 
 @lru_cache(maxsize=1)
 def _get_st_model() -> SentenceTransformer:
     config = get_config()
+    configure_huggingface_auth()
     return SentenceTransformer(config.EMBED_MODEL)
 
 
 def embed(text: str) -> list[float]:
     config = get_config()
     if config.EMBED_BACKEND == "lmstudio":
-        response = httpx.post(
+        response = post(
             f"{config.LLM_BASE_URL}/embeddings",
             json={"model": config.EMBED_MODEL, "input": text},
             timeout=60.0,
