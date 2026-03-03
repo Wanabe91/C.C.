@@ -1,21 +1,19 @@
 import argparse
 import asyncio
+
 import yaml
 
 # Optional modules are not included in this repository.
 # from utils.event_bus import EventBus
-from modules.llm_client import LLMClient
 # from modules.stt import SpeechRecognizer
 # from modules.tts import TextToSpeech
 # from modules.vision import VisionModule
 from modules.planner import Planner
-from modules.memory import Memory
+
 
 class PersonalAI:
     def __init__(self, config):
-        self.llm = LLMClient(config["llm"])
-        self.memory = Memory(config.get("memory", {}))
-        self.planner = Planner(self.llm, self.memory, config.get("planner", {}))
+        self.planner = Planner(config)
 
         # Text mode works without optional voice/vision modules.
         self.tts = None
@@ -34,17 +32,21 @@ class PersonalAI:
     async def _on_frame(self, _frame):
         raise RuntimeError("Vision mode is unavailable in this repository.")
 
+    async def close(self):
+        await self.planner.close()
+
     async def text_mode(self):
         while True:
-            inp = input("Вы: ").strip()
+            inp = input("You: ").strip()
             if not inp:
                 continue
-            if inp.lower() in ("exit", "выход"):
+            if inp.lower() in ("exit", "\u0432\u044b\u0445\u043e\u0434"):
                 break
             try:
                 print(f"AI: {await self._on_text(inp)}\n")
             except Exception as exc:
-                print(f"Ошибка: {exc}\n")
+                print(f"Error: {exc}\n")
+
 
 async def main():
     parser = argparse.ArgumentParser()
@@ -56,11 +58,15 @@ async def main():
         cfg = yaml.safe_load(f)
 
     ai = PersonalAI(cfg)
-    if args.mode == "text":
-        await ai.text_mode()
-        return
+    try:
+        if args.mode == "text":
+            await ai.text_mode()
+            return
 
-    raise SystemExit(f"{args.mode} mode is unavailable in this repository. Use --mode text.")
+        raise SystemExit(f"{args.mode} mode is unavailable in this repository. Use --mode text.")
+    finally:
+        await ai.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())

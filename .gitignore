@@ -1,0 +1,9 @@
+.venv/
+.venv312/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+agent_memory.db
+chroma_store/
+data/agent_memory.db
