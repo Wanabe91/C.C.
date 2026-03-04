@@ -1,16 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from pathlib import Path
-from urllib.parse import urlparse
 
-from memory_engine.config import get_config
+from memory_engine.config import Config, set_active_config
 from memory_engine.consolidator import run_consolidator
 from memory_engine.db import init_db
 from memory_engine.indexer import run_indexer
 from memory_engine.interrupt import InterruptChannel
 from memory_engine.loop import ingest_event
+from memory_engine.tool_registry import assert_registry_integrity
 
 
 def _normalize_llm_base_url(raw_url: str) -> str:
@@ -55,46 +54,46 @@ def _default_obsidian_vault(memory_cfg: dict) -> str:
     return str(Path(sqlite_path).resolve().parent / "obsidian")
 
 
-def _configure_memory_engine(app_cfg: dict) -> None:
+def _positive_int(value: object, default: int) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int) and value > 0:
+        return value
+    return default
+
+
+def _build_memory_engine_config(app_cfg: dict) -> Config:
     llm_cfg = app_cfg.get("llm", {}) if isinstance(app_cfg, dict) else {}
     memory_cfg = app_cfg.get("memory", {}) if isinstance(app_cfg, dict) else {}
     planner_cfg = app_cfg.get("planner", {}) if isinstance(app_cfg, dict) else {}
 
-    base_url = _normalize_llm_base_url(str(llm_cfg.get("base_url") or "http://localhost:1234/v1"))
-    parsed = urlparse(base_url)
-    if not parsed.scheme or not parsed.netloc:
-        raise ValueError(f"Invalid LLM base URL: {base_url}")
-
-    os.environ["LLM_BASE_URL"] = base_url
-    os.environ["LLM_MODEL"] = str(llm_cfg.get("model") or "local-model")
-    os.environ["ASSISTANT_SYSTEM_PROMPT"] = str(llm_cfg.get("system_prompt") or "")
-    os.environ["SQLITE_PATH"] = _default_sqlite_path(memory_cfg)
-    os.environ["CHROMA_PATH"] = _default_chroma_path(memory_cfg)
-    os.environ["OBSIDIAN_VAULT_PATH"] = _default_obsidian_vault(memory_cfg)
-
-    embed_backend = str(memory_cfg.get("embed_backend") or os.environ.get("EMBED_BACKEND") or "").strip()
-    if embed_backend:
-        os.environ["EMBED_BACKEND"] = embed_backend
-
-    embed_model = str(memory_cfg.get("embed_model") or os.environ.get("EMBED_MODEL") or "").strip()
-    if embed_model:
-        os.environ["EMBED_MODEL"] = embed_model
-
-    max_recent_messages = planner_cfg.get("max_recent_messages")
-    if isinstance(max_recent_messages, int) and max_recent_messages > 0:
-        os.environ["MAX_RECENT_MESSAGES"] = str(max_recent_messages)
-
-    max_context_facts = memory_cfg.get("max_context_facts")
-    if isinstance(max_context_facts, int) and max_context_facts > 0:
-        os.environ["MAX_CONTEXT_FACTS"] = str(max_context_facts)
-
-    get_config.cache_clear()
+    sqlite_path = Path(_default_sqlite_path(memory_cfg)).expanduser().resolve()
+    # Keep these defaults aligned with load_config_from_env() so both startup modes behave the same.
+    return Config(
+        SQLITE_PATH=sqlite_path,
+        CHROMA_PATH=Path(_default_chroma_path(memory_cfg)).expanduser().resolve(),
+        OBSIDIAN_VAULT_PATH=Path(_default_obsidian_vault(memory_cfg)).expanduser().resolve(),
+        LLM_BASE_URL=_normalize_llm_base_url(str(llm_cfg.get("base_url") or "http://localhost:1234/v1")),
+        LLM_MODEL=str(llm_cfg.get("model") or "local-model"),
+        ASSISTANT_SYSTEM_PROMPT=str(llm_cfg.get("system_prompt") or ""),
+        EMBED_BACKEND=str(memory_cfg.get("embed_backend") or "sentence_transformers").strip().lower(),
+        EMBED_MODEL=str(
+            memory_cfg.get("embed_model")
+            or "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+        ),
+        VERSION_DRIFT_THRESHOLD=_positive_int(planner_cfg.get("version_drift_threshold"), 5),
+        CONSOLIDATION_INTERVAL_SEC=_positive_int(memory_cfg.get("consolidation_interval_sec"), 60),
+        INDEXER_POLL_INTERVAL_SEC=_positive_int(memory_cfg.get("indexer_poll_interval_sec"), 2),
+        MAX_CONTEXT_FACTS=_positive_int(memory_cfg.get("max_context_facts"), 20),
+        MAX_RECENT_MESSAGES=_positive_int(planner_cfg.get("max_recent_messages"), 10),
+    )
 
 
 class Planner:
     def __init__(self, app_cfg: dict | None = None):
         self.app_cfg = app_cfg or {}
-        _configure_memory_engine(self.app_cfg)
+        set_active_config(_build_memory_engine_config(self.app_cfg))
+        assert_registry_integrity()
         init_db()
 
         self._interrupt = InterruptChannel()

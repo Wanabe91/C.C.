@@ -24,6 +24,11 @@ async def _wait_or_stop(stop_event: asyncio.Event, seconds: float) -> None:
         return
 
 
+def _mark_outbox_complete(outbox_id: int) -> None:
+    mark_outbox_done(outbox_id)
+    recompute_vector_watermark()
+
+
 async def run_indexer(stop_event: asyncio.Event) -> None:
     config = get_config()
     while not stop_event.is_set():
@@ -31,18 +36,17 @@ async def run_indexer(stop_event: asyncio.Event) -> None:
         if item is None:
             await _wait_or_stop(stop_event, config.INDEXER_POLL_INTERVAL_SEC)
             continue
+        outbox_id = item["id"]
 
         fact = get_fact_by_id(item["fact_id"])
         if fact is None or fact.status != "active":
-            mark_outbox_done(item["id"])
-            recompute_vector_watermark()
+            _mark_outbox_complete(outbox_id)
             continue
 
         try:
             collection = get_collection()
             if collection is None:
-                mark_outbox_done(item["id"])
-                recompute_vector_watermark()
+                _mark_outbox_complete(outbox_id)
                 continue
             vector = embed(fact.content)
             metadata = {
@@ -58,8 +62,7 @@ async def run_indexer(stop_event: asyncio.Event) -> None:
                 documents=[fact.content],
                 metadatas=[metadata],
             )
-            mark_outbox_done(item["id"])
-            recompute_vector_watermark()
+            _mark_outbox_complete(outbox_id)
         except Exception:
             logger.exception("Indexer failed to embed or upsert fact %s", item["fact_id"])
-            mark_outbox_failed(item["id"])
+            mark_outbox_failed(outbox_id)

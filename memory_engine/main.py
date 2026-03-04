@@ -6,12 +6,13 @@ import logging
 import sys
 from typing import Any
 
-from .config import get_config
+from .config import load_config_from_env, set_active_config
 from .consolidator import run_consolidator
 from .db import init_db
 from .indexer import run_indexer
 from .interrupt import InterruptChannel
 from .loop import ingest_event
+from .tool_registry import assert_registry_integrity
 
 
 def _parse_event_stream(payload: str) -> list[dict[str, Any]]:
@@ -55,9 +56,19 @@ async def _collect_events() -> list[dict[str, Any]]:
     return events
 
 
+async def _shutdown_workers(workers: list[asyncio.Task]) -> None:
+    try:
+        await asyncio.wait_for(asyncio.gather(*workers, return_exceptions=True), timeout=5)
+    except asyncio.TimeoutError:
+        for worker in workers:
+            worker.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+
+
 async def start() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    get_config()
+    set_active_config(load_config_from_env())
+    assert_registry_integrity()
     init_db()
     stop_event = asyncio.Event()
     interrupt = InterruptChannel()
@@ -71,12 +82,7 @@ async def start() -> None:
             await ingest_event(raw, interrupt)
     finally:
         stop_event.set()
-        try:
-            await asyncio.wait_for(asyncio.gather(*workers, return_exceptions=True), timeout=5)
-        except asyncio.TimeoutError:
-            for worker in workers:
-                worker.cancel()
-            await asyncio.gather(*workers, return_exceptions=True)
+        await _shutdown_workers(workers)
 
 
 if __name__ == "__main__":

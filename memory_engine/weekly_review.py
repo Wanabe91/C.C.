@@ -54,6 +54,10 @@ def _task_title(task: dict[str, Any]) -> str:
     return str(task.get("title") or "").strip()
 
 
+def _count_messages_by_role(messages: list[dict[str, Any]], role: str) -> int:
+    return sum(message.get("role") == role for message in messages)
+
+
 def generate_weekly_review(args: dict[str, Any] | None = None) -> dict[str, Any]:
     args = args or {}
     week_start = _coerce_week_start(args)
@@ -61,7 +65,8 @@ def generate_weekly_review(args: dict[str, Any] | None = None) -> dict[str, Any]
     tz = datetime.now().astimezone().tzinfo
     start_ts = datetime.combine(week_start, time.min, tzinfo=tz).timestamp()
     end_ts = datetime.combine(week_end, time.min, tzinfo=tz).timestamp()
-    week_key = f"{week_start.isocalendar().year}-W{week_start.isocalendar().week:02d}"
+    week_info = week_start.isocalendar()
+    week_key = f"{week_info.year}-W{week_info.week:02d}"
 
     facts = list_facts_created_between(start_ts, end_ts)
     decisions = [fact for fact in facts if _decision_kind(fact.get("meta") or {})]
@@ -74,6 +79,8 @@ def generate_weekly_review(args: dict[str, Any] | None = None) -> dict[str, Any]
     event_count = count_events_between(start_ts, end_ts)
     title = str(args.get("title") or f"Weekly Review {week_key}").strip()
     focus = str(args.get("focus") or "").strip()
+    user_message_count = _count_messages_by_role(messages, "user")
+    assistant_message_count = _count_messages_by_role(messages, "assistant")
 
     recent_user_messages = [
         str(message["content"]).strip()
@@ -95,8 +102,8 @@ def generate_weekly_review(args: dict[str, Any] | None = None) -> dict[str, Any]
         "tasks_created": len(tasks_created),
         "tasks_completed": len(tasks_completed),
         "open_tasks": len(open_tasks),
-        "user_messages": len([message for message in messages if message.get("role") == "user"]),
-        "assistant_messages": len([message for message in messages if message.get("role") == "assistant"]),
+        "user_messages": user_message_count,
+        "assistant_messages": assistant_message_count,
         "focus": focus,
     }
 
@@ -159,7 +166,7 @@ def generate_weekly_review(args: dict[str, Any] | None = None) -> dict[str, Any]
         lines.append("")
         lines.extend([f"- {task.title}" for task in open_tasks[:10] if task.title])
         lines.append("")
-    if not tasks_created and not tasks_completed and not open_tasks:
+    if not any((tasks_created, tasks_completed, open_tasks)):
         lines.append("- No task activity recorded.")
 
     lines.extend(["## Planner Diagnostics", ""])

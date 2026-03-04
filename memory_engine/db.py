@@ -12,9 +12,10 @@ from .models import Fact, Task
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS state_versions (
   id INTEGER PRIMARY KEY CHECK (id = 1),
-  version INTEGER NOT NULL
+  version INTEGER NOT NULL,
+  event_version INTEGER NOT NULL DEFAULT 0
 );
-INSERT OR IGNORE INTO state_versions(id, version) VALUES (1, 0);
+INSERT OR IGNORE INTO state_versions(id, version, event_version) VALUES (1, 0, 0);
 
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -93,6 +94,9 @@ CREATE TABLE IF NOT EXISTS step_traces (
   current_state_version INTEGER,
   revalidation_status TEXT NOT NULL,
   rejection_reason TEXT,
+  replan_reason TEXT,
+  replan_count INTEGER,
+  replan_diff_summary TEXT,
   execution_status TEXT,
   result_json TEXT,
   created_at REAL NOT NULL
@@ -134,7 +138,26 @@ def _migrate_state_versions(conn: sqlite3.Connection) -> None:
 
     columns = conn.execute("PRAGMA table_info(state_versions)").fetchall()
     column_names = [str(column["name"]) for column in columns]
-    if column_names == ["id", "version"]:
+    if set(column_names) == {"id", "version", "event_version"}:
+        current = conn.execute(
+            "SELECT COALESCE(MAX(version), 0), COALESCE(MAX(event_version), 0) FROM state_versions"
+        ).fetchone()
+        current_version = int(current[0]) if current else 0
+        current_event_version = int(current[1]) if current else 0
+        conn.execute("DELETE FROM state_versions WHERE id != 1")
+        conn.execute(
+            """
+            INSERT INTO state_versions(id, version, event_version)
+            VALUES (1, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              version = excluded.version,
+              event_version = excluded.event_version
+            """,
+            (current_version, max(current_event_version, current_version)),
+        )
+        return
+
+    if set(column_names) == {"id", "version"}:
         current = conn.execute(
             "SELECT COALESCE(MAX(version), 0) FROM state_versions"
         ).fetchone()
@@ -148,24 +171,39 @@ def _migrate_state_versions(conn: sqlite3.Connection) -> None:
             """,
             (current_version,),
         )
+        conn.execute(
+            "ALTER TABLE state_versions ADD COLUMN event_version INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.execute(
+            "UPDATE state_versions SET event_version = ? WHERE id = 1",
+            (current_version,),
+        )
         return
 
     current = conn.execute(
         "SELECT COALESCE(MAX(version), 0) FROM state_versions"
     ).fetchone()
     current_version = int(current[0]) if current else 0
+    if "event_version" in column_names:
+        current_event = conn.execute(
+            "SELECT COALESCE(MAX(event_version), 0) FROM state_versions"
+        ).fetchone()
+        current_event_version = int(current_event[0]) if current_event else 0
+    else:
+        current_event_version = current_version
     conn.execute("ALTER TABLE state_versions RENAME TO state_versions_legacy")
     conn.execute(
         """
         CREATE TABLE state_versions (
           id INTEGER PRIMARY KEY CHECK (id = 1),
-          version INTEGER NOT NULL
+          version INTEGER NOT NULL,
+          event_version INTEGER NOT NULL DEFAULT 0
         )
         """
     )
     conn.execute(
-        "INSERT INTO state_versions(id, version) VALUES (1, ?)",
-        (current_version,),
+        "INSERT INTO state_versions(id, version, event_version) VALUES (1, ?, ?)",
+        (current_version, max(current_event_version, current_version)),
     )
     conn.execute("DROP TABLE state_versions_legacy")
 
@@ -192,6 +230,9 @@ def _migrate_runtime_tables(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "weekly_reviews", "note_path", "TEXT")
     _ensure_column(conn, "consolidation_proposals", "proposal_type", "TEXT")
     _ensure_column(conn, "consolidation_proposals", "proposal_json", "TEXT")
+    _ensure_column(conn, "step_traces", "replan_reason", "TEXT")
+    _ensure_column(conn, "step_traces", "replan_count", "INTEGER")
+    _ensure_column(conn, "step_traces", "replan_diff_summary", "TEXT")
     conn.execute(
         """
         UPDATE facts
@@ -218,6 +259,13 @@ def _migrate_runtime_tables(conn: sqlite3.Connection) -> None:
 def _get_state_version(conn: sqlite3.Connection) -> int:
     row = conn.execute(
         "SELECT version FROM state_versions WHERE id = 1"
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def _get_event_version(conn: sqlite3.Connection) -> int:
+    row = conn.execute(
+        "SELECT event_version FROM state_versions WHERE id = 1"
     ).fetchone()
     return int(row[0]) if row else 0
 
@@ -326,12 +374,28 @@ def bump_version(conn: sqlite3.Connection) -> int:
     return _get_state_version(conn)
 
 
+def bump_event_version(conn: sqlite3.Connection) -> int:
+    # event_version advances once per ingested event; version still tracks every write.
+    conn.execute("UPDATE state_versions SET event_version = event_version + 1 WHERE id = 1")
+    return _get_event_version(conn)
+
+
 def get_version() -> int:
     conn = _connect()
     try:
         return _get_state_version(conn)
     finally:
         conn.close()
+
+
+def get_event_version(conn: sqlite3.Connection | None = None) -> int:
+    if conn is not None:
+        return _get_event_version(conn)
+    local_conn = _connect()
+    try:
+        return _get_event_version(local_conn)
+    finally:
+        local_conn.close()
 
 
 def get_vector_watermark() -> int:
@@ -601,16 +665,20 @@ def insert_step_trace(
     current_state_version: int | None,
     revalidation_status: str,
     rejection_reason: str | None,
-    execution_status: str | None,
-    result: dict[str, Any] | None,
+    replan_reason: str | None = None,
+    replan_count: int | None = None,
+    replan_diff_summary: dict[str, Any] | None = None,
+    execution_status: str | None = None,
+    result: dict[str, Any] | None = None,
 ) -> int:
     cur = conn.execute(
         """
         INSERT INTO step_traces(
             planner_run_id, step_index, action, tool, args_json, precondition_fact_ids,
             reasoning, snapshot_state_version, current_state_version, revalidation_status,
-            rejection_reason, execution_status, result_json, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            rejection_reason, replan_reason, replan_count, replan_diff_summary,
+            execution_status, result_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             planner_run_id,
@@ -624,6 +692,9 @@ def insert_step_trace(
             current_state_version,
             revalidation_status,
             rejection_reason,
+            replan_reason,
+            replan_count,
+            json.dumps(replan_diff_summary, ensure_ascii=False) if replan_diff_summary is not None else None,
             execution_status,
             json.dumps(result, ensure_ascii=False) if result is not None else None,
             time.time(),
@@ -698,6 +769,13 @@ def list_step_traces_for_planner_run(planner_run_id: int) -> list[dict[str, Any]
                 ),
                 "revalidation_status": row["revalidation_status"],
                 "rejection_reason": row["rejection_reason"],
+                "replan_reason": row["replan_reason"] if "replan_reason" in row.keys() else None,
+                "replan_count": (
+                    int(row["replan_count"])
+                    if "replan_count" in row.keys() and row["replan_count"] is not None
+                    else None
+                ),
+                "replan_diff_summary": _loads_json(row["replan_diff_summary"] if "replan_diff_summary" in row.keys() else None),
                 "execution_status": row["execution_status"],
                 "result": _loads_json(row["result_json"]),
                 "created_at": float(row["created_at"]),

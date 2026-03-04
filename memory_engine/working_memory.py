@@ -48,6 +48,17 @@ def _normalize_tasks(raw: Any) -> list[Task]:
     return tasks
 
 
+def _copy_task(task: Task) -> Task:
+    return Task(
+        id=task.id,
+        title=task.title,
+        status=task.status,
+        constraint=dict(task.constraint) if task.constraint else None,
+        active_from_version=task.active_from_version,
+        completed_version=task.completed_version,
+    )
+
+
 class WorkingMemory:
     def __init__(self) -> None:
         self._lock = Lock()
@@ -65,17 +76,7 @@ class WorkingMemory:
 
     def get_active_tasks(self) -> list[Task]:
         with self._lock:
-            return [
-                Task(
-                    id=task.id,
-                    title=task.title,
-                    status=task.status,
-                    constraint=dict(task.constraint) if task.constraint else None,
-                    active_from_version=task.active_from_version,
-                    completed_version=task.completed_version,
-                )
-                for task in self._tasks
-            ]
+            return [_copy_task(task) for task in self._tasks]
 
     def get_constraints(self) -> list[dict[str, Any]]:
         with self._lock:

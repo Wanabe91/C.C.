@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import logging
 import re
+import warnings
 from threading import Lock
 from typing import Any
-import warnings
 
 from .config import get_config
 from .db import (
@@ -17,7 +17,7 @@ from .db import (
     touch_fact_accesses,
 )
 from .embeddings import embed
-from .models import ContextSnapshot, Fact, Task
+from .models import ContextFingerprint, ContextSnapshot, Fact, FingerprintDiff, Task
 from .working_memory import working_memory
 
 _collection = None
@@ -195,7 +195,111 @@ def _merge_tasks(persisted_tasks: list[Task], transient_tasks: list[Task]) -> li
     return merged
 
 
-def build_context_snapshot(current_version: int, vector_watermark: int, query: str) -> ContextSnapshot:
+def _fact_fingerprint_tuple(fact: Fact) -> tuple[int, str, str]:
+    return (fact.version_created, fact.status, fact.tier)
+
+
+def _load_last_entity_id(conn, table_name: str) -> str | None:
+    row = conn.execute(f"SELECT id FROM {table_name} ORDER BY id DESC LIMIT 1").fetchone()
+    return None if row is None else str(int(row["id"]))
+
+
+def _load_active_task_ids(conn) -> set[str]:
+    rows = conn.execute(
+        """
+        SELECT id
+        FROM tasks
+        WHERE status = 'active'
+        ORDER BY id ASC
+        """
+    ).fetchall()
+    return {str(int(row["id"])) for row in rows}
+
+
+def _build_fact_versions(facts: list[Fact]) -> dict[str, tuple[int, str, str]]:
+    return {str(fact.id): _fact_fingerprint_tuple(fact) for fact in facts}
+
+
+def build_context_fingerprint(facts: list[Fact], active_task_ids: set[str]) -> ContextFingerprint:
+    conn = _connect()
+    try:
+        return ContextFingerprint(
+            fact_versions=_build_fact_versions(facts),
+            active_task_ids=set(active_task_ids),
+            last_summary_id=_load_last_entity_id(conn, "summaries"),
+            last_message_id=_load_last_entity_id(conn, "messages"),
+            # vector_watermark is excluded because index lag is async bookkeeping, not semantic drift.
+        )
+    finally:
+        conn.close()
+
+
+def refresh_context_fingerprint(snapshot_fingerprint: ContextFingerprint) -> ContextFingerprint:
+    tracked_fact_ids: list[int] = []
+    for fact_id in snapshot_fingerprint.fact_versions:
+        try:
+            tracked_fact_ids.append(int(fact_id))
+        except (TypeError, ValueError):
+            continue
+
+    conn = _connect()
+    try:
+        current_fact_versions: dict[str, tuple[int, str, str]] = {}
+        if tracked_fact_ids:
+            placeholders = ",".join("?" for _ in tracked_fact_ids)
+            rows = conn.execute(
+                f"""
+                SELECT id, version_created, status, tier
+                FROM facts
+                WHERE id IN ({placeholders})
+                """,
+                tuple(tracked_fact_ids),
+            ).fetchall()
+            for row in rows:
+                current_fact_versions[str(int(row["id"]))] = (
+                    int(row["version_created"]),
+                    row["status"],
+                    row["tier"],
+                )
+        return ContextFingerprint(
+            fact_versions=current_fact_versions,
+            active_task_ids=_load_active_task_ids(conn),
+            last_summary_id=_load_last_entity_id(conn, "summaries"),
+            last_message_id=_load_last_entity_id(conn, "messages"),
+        )
+    finally:
+        conn.close()
+
+
+def fingerprint_diff(a: ContextFingerprint, b: ContextFingerprint) -> FingerprintDiff:
+    changed_fact_ids = sorted(
+        fact_id
+        for fact_id, snapshot_state in a.fact_versions.items()
+        if fact_id in b.fact_versions and b.fact_versions[fact_id] != snapshot_state
+    )
+    removed_fact_ids = sorted(
+        fact_id for fact_id in a.fact_versions if fact_id not in b.fact_versions
+    )
+    task_changes = a.active_task_ids != b.active_task_ids
+    message_changes = (
+        a.last_summary_id != b.last_summary_id
+        or a.last_message_id != b.last_message_id
+    )
+    return FingerprintDiff(
+        changed_fact_ids=changed_fact_ids,
+        removed_fact_ids=removed_fact_ids,
+        task_changes=task_changes,
+        message_changes=message_changes,
+        is_empty=not (changed_fact_ids or removed_fact_ids or task_changes or message_changes),
+    )
+
+
+def build_context_snapshot(
+    current_version: int,
+    event_version: int,
+    vector_watermark: int,
+    query: str,
+) -> ContextSnapshot:
     config = get_config()
     persisted_tasks = get_persisted_active_tasks()
     transient_tasks = working_memory.get_active_tasks()
@@ -203,13 +307,19 @@ def build_context_snapshot(current_version: int, vector_watermark: int, query: s
     fts_results = fts_search(query, config.MAX_CONTEXT_FACTS)
     vector_results = chroma_search(query, config.MAX_CONTEXT_FACTS, vector_watermark)
     delta_facts = get_db_delta_facts(current_version, vector_watermark)
-    touched_fact_ids = sorted({fact.id for fact in [*fts_results, *vector_results, *delta_facts]})
+    all_context_facts = [*fts_results, *vector_results, *delta_facts]
+    touched_fact_ids = sorted({fact.id for fact in all_context_facts})
     if touched_fact_ids:
         touch_fact_accesses(touched_fact_ids)
     recent_messages = get_recent_messages(config.MAX_RECENT_MESSAGES)
     return ContextSnapshot(
         state_version=current_version,
+        event_version=event_version,
         vector_watermark=vector_watermark,
+        fingerprint=build_context_fingerprint(
+            all_context_facts,
+            {str(task.id) for task in persisted_tasks if task.status == "active"},
+        ),
         tasks=_merge_tasks(persisted_tasks, transient_tasks),
         constraints=constraints,
         fts_results=fts_results,

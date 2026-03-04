@@ -2,13 +2,15 @@ from urllib.parse import urlparse
 
 import httpx
 
+
 class LLMClient:
     def __init__(self, cfg):
         base_url = cfg["base_url"].rstrip("/")
-        if base_url.endswith("/chat/completions"):
-            self.url = base_url
-        else:
-            self.url = base_url + "/chat/completions"
+        self.url = (
+            base_url
+            if base_url.endswith("/chat/completions")
+            else f"{base_url}/chat/completions"
+        )
         self.model = cfg["model"]
         self.system = cfg.get("system_prompt", "")
         self.timeout = cfg.get("timeout", 30)
@@ -24,14 +26,21 @@ class LLMClient:
             self.headers["Authorization"] = f"Bearer {cfg['api_key']}"
 
     def _msgs(self, history=None, user=None):
-        messages = []
-        if self.system:
-            messages.append({"role": "system", "content": self.system})
+        messages = [{"role": "system", "content": self.system}] if self.system else []
         if history:
             messages.extend(history)
         if user is not None:
             messages.append({"role": "user", "content": user})
         return messages
+
+    def _payload(self, messages, **extra):
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            **self.params,
+        }
+        payload.update(extra)
+        return payload
 
     async def _post(self, payload):
         try:
@@ -54,20 +63,12 @@ class LLMClient:
 
     async def chat(self, user, history=None):
         messages = user if isinstance(user, list) else self._msgs(history or [], user)
-        data = await self._post({
-            "model": self.model,
-            "messages": messages,
-            **self.params,
-        })
+        data = await self._post(self._payload(messages))
         return data["choices"][0]["message"]["content"].strip()
 
     async def chat_with_tools(self, user, tools, history=None):
         messages = user if isinstance(user, list) else self._msgs(history or [], user)
-        data = await self._post({
-            "model": self.model,
-            "messages": messages,
-            "tools": tools,
-            "tool_choice": "auto",
-            **self.params,
-        })
+        data = await self._post(
+            self._payload(messages, tools=tools, tool_choice="auto")
+        )
         return data["choices"][0]["message"]

@@ -125,6 +125,22 @@ def _fact_payload(fact: Fact) -> dict[str, Any]:
     }
 
 
+def _append_unique_facts(
+    target: list[Fact],
+    seen: set[int],
+    facts: list[Fact],
+    *,
+    limit: int,
+) -> None:
+    for fact in facts:
+        if fact.id in seen:
+            continue
+        seen.add(fact.id)
+        target.append(fact)
+        if len(target) >= limit:
+            return
+
+
 def _candidate_facts(limit: int) -> list[Fact]:
     recent_limit = max(limit // 2, 1)
     stale_limit = max(limit - recent_limit, 1)
@@ -132,11 +148,13 @@ def _candidate_facts(limit: int) -> list[Fact]:
     stale = list_stale_active_facts(limit=stale_limit)
     merged: list[Fact] = []
     seen: set[int] = set()
-    for fact in [*recent, *stale, *list_recent_active_facts(limit=max(limit, 1)), *list_stale_active_facts(limit=max(limit, 1))]:
-        if fact.id in seen:
-            continue
-        seen.add(fact.id)
-        merged.append(fact)
+    for batch in (
+        recent,
+        stale,
+        list_recent_active_facts(limit=max(limit, 1)),
+        list_stale_active_facts(limit=max(limit, 1)),
+    ):
+        _append_unique_facts(merged, seen, batch, limit=limit)
         if len(merged) >= limit:
             break
     return merged
