@@ -32,8 +32,10 @@ PLANNER_JSON_SCHEMA = {
 PLANNER_SYSTEM_PROMPT = (
     "You are the planning engine for a persistent local AI assistant.\n"
     "Output only valid JSON.\n"
-    "Allowed tools: respond, remember_fact, create_task, complete_task, noop.\n"
+    "Allowed tools: respond, remember_fact, create_task, complete_task, generate_weekly_review, noop.\n"
     "Prefer short, deterministic plans.\n"
+    "Escalation rule: if an inbox thought changes what should happen today or tomorrow, store it as a decision via remember_fact with meta.kind='decision_log' and include a review_date.\n"
+    "If the user asks for a weekly/retrospective overview, use generate_weekly_review before the final respond step.\n"
     "If the user only needs a direct answer, emit one respond step."
 )
 

@@ -1,14 +1,91 @@
 from __future__ import annotations
 
+from datetime import date
+import sqlite3
 from typing import Any
 
 from .config import get_config
-from .db import get_fact_by_id
+from .db import get_active_tasks, get_fact_by_id, list_recent_active_facts
 from .models import PlanStep
 
 
 def _normalize_constraint(value: Any) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
+
+
+def _parse_iso_date(value: str | None) -> date | None:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _build_weekly_review_message(args: dict[str, Any]) -> str:
+    raw_lookback = args.get("lookback_facts")
+    if isinstance(raw_lookback, int):
+        lookback = raw_lookback
+    elif isinstance(raw_lookback, str) and raw_lookback.strip().isdigit():
+        lookback = int(raw_lookback.strip())
+    else:
+        lookback = 25
+    try:
+        recent_facts = list_recent_active_facts(limit=max(5, min(lookback, 100)))
+        active_tasks = get_active_tasks()
+    except sqlite3.OperationalError:
+        return "Weekly review draft is unavailable because the memory database is not initialized yet."
+    today = date.today()
+
+    overdue_reviews: list[tuple[str, str]] = []
+    decision_notes: list[str] = []
+    inbox_candidates: list[str] = []
+    for fact in recent_facts:
+        meta = fact.meta if isinstance(fact.meta, dict) else {}
+        kind = str(meta.get("kind") or "").strip().lower()
+        review_date = _parse_iso_date(str(meta.get("review_date") or "").strip())
+        if kind == "decision_log":
+            decision_notes.append(fact.content)
+            if review_date and review_date < today:
+                overdue_reviews.append((fact.content, review_date.isoformat()))
+        elif kind in {"inbox", "thought"}:
+            inbox_candidates.append(fact.content)
+
+    lines = [
+        "Weekly review draft",
+        f"- Active tasks: {len(active_tasks)}",
+        f"- Recent active facts scanned: {len(recent_facts)}",
+        "",
+        "1) Overdue decision reviews",
+    ]
+    if overdue_reviews:
+        lines.extend([f"- [OVERDUE since {due}] {content}" for content, due in overdue_reviews[:10]])
+    else:
+        lines.append("- None")
+
+    lines.extend(["", "2) Inbox escalation check (today/tomorrow impact)"])
+    if inbox_candidates:
+        lines.extend([f"- Consider escalating: {item}" for item in inbox_candidates[:10]])
+    else:
+        lines.append("- No explicit inbox-tagged facts found")
+
+    lines.extend(["", "3) Recent decision log entries"])
+    if decision_notes:
+        lines.extend([f"- {item}" for item in decision_notes[:10]])
+    else:
+        lines.append("- No decision_log entries found")
+
+    lines.extend(["", "4) Active tasks snapshot"])
+    if active_tasks:
+        lines.extend([f"- #{task.id}: {task.title}" for task in active_tasks[:10]])
+    else:
+        lines.append("- No active tasks")
+
+    lines.extend([
+        "",
+        "Next step: convert any inbox item that affects today/tomorrow into a decision_log fact with a review_date.",
+    ])
+    return "\n".join(lines)
 
 
 async def execute_step(step: PlanStep) -> dict[str, Any]:
@@ -72,6 +149,10 @@ async def execute_step(step: PlanStep) -> dict[str, Any]:
         return base_result
 
     if tool_name == "noop":
+        return base_result
+
+    if tool_name == "generate_weekly_review":
+        base_result["assistant_message"] = _build_weekly_review_message(args)
         return base_result
 
     return {

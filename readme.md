@@ -219,6 +219,7 @@ Allowed planning tools are constrained by prompt to:
 - `remember_fact`
 - `create_task`
 - `complete_task`
+- `generate_weekly_review`
 - `noop`
 
 There is no dynamic tool registry. The planner prompt and executor implementation must stay aligned manually.
@@ -246,6 +247,8 @@ Supported behaviors:
   Produces task rows to persist.
 - `complete_task`
   Produces task IDs to mark completed.
+- `generate_weekly_review`
+  Produces a structured weekly review draft from recent active facts and tasks.
 - `noop`
   Produces no side effects.
 - unsupported tool
