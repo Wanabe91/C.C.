@@ -5,6 +5,7 @@ from typing import Any
 from .config import get_config
 from .db import get_fact_by_id
 from .models import PlanStep
+from .weekly_review import generate_weekly_review
 
 
 def _normalize_constraint(value: Any) -> dict[str, Any] | None:
@@ -20,6 +21,7 @@ async def execute_step(step: PlanStep) -> dict[str, Any]:
         "facts": [],
         "created_tasks": [],
         "completed_task_ids": [],
+        "generated_reviews": [],
         "meta": {"action": step.action, "tool": tool_name},
     }
 
@@ -42,7 +44,14 @@ async def execute_step(step: PlanStep) -> dict[str, Any]:
                 "status": "error",
                 "meta": {**base_result["meta"], "error": "empty_fact"},
             }
-        base_result["facts"] = [{"content": content, "meta": _normalize_constraint(args.get("meta")) or {}}]
+        base_result["facts"] = [
+            {
+                "content": content,
+                "importance": args.get("importance"),
+                "tier": args.get("tier"),
+                "meta": _normalize_constraint(args.get("meta")) or {},
+            }
+        ]
         return base_result
 
     if tool_name == "create_task":
@@ -71,6 +80,13 @@ async def execute_step(step: PlanStep) -> dict[str, Any]:
         base_result["completed_task_ids"] = task_ids
         return base_result
 
+    if tool_name == "generate_weekly_review":
+        review = generate_weekly_review(args)
+        base_result["generated_reviews"] = [review]
+        base_result["assistant_message"] = review["markdown"]
+        base_result["meta"] = {**base_result["meta"], "week_key": review["week_key"]}
+        return base_result
+
     if tool_name == "noop":
         return base_result
 
@@ -82,12 +98,18 @@ async def execute_step(step: PlanStep) -> dict[str, Any]:
     }
 
 
-def revalidate(step: PlanStep, current_V: int, snap_V: int) -> bool:
+def revalidate(step: PlanStep, current_V: int, snap_V: int) -> tuple[bool, str | None]:
     config = get_config()
-    if current_V - snap_V > config.VERSION_DRIFT_THRESHOLD:
-        return False
+    drift = current_V - snap_V
+    if drift > config.VERSION_DRIFT_THRESHOLD:
+        return (
+            False,
+            f"state_version_drift:{drift}:threshold:{config.VERSION_DRIFT_THRESHOLD}",
+        )
     for fid in step.precondition_fact_ids:
         fact = get_fact_by_id(fid)
-        if fact is None or fact.status != "active":
-            return False
-    return True
+        if fact is None:
+            return False, f"missing_precondition_fact:{fid}"
+        if fact.status != "active":
+            return False, f"stale_precondition_fact:{fid}:status:{fact.status}"
+    return True, None

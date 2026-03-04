@@ -25,6 +25,7 @@ memory:
   short_term_limit: 20
   episodic_enabled: true
   episodic_db: "data/episodic"
+  obsidian_vault: "data/obsidian"
   profile_path: "data/profile.json"
   embed_backend: "lmstudio"
   embed_model: "text-embedding-sts-multilingual-mpnet-base-v2"

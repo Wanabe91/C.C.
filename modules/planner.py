@@ -46,6 +46,15 @@ def _default_chroma_path(memory_cfg: dict) -> str:
     return "./chroma_store"
 
 
+def _default_obsidian_vault(memory_cfg: dict) -> str:
+    explicit = str(memory_cfg.get("obsidian_vault") or "").strip()
+    if explicit:
+        return explicit
+
+    sqlite_path = _default_sqlite_path(memory_cfg)
+    return str(Path(sqlite_path).resolve().parent / "obsidian")
+
+
 def _configure_memory_engine(app_cfg: dict) -> None:
     llm_cfg = app_cfg.get("llm", {}) if isinstance(app_cfg, dict) else {}
     memory_cfg = app_cfg.get("memory", {}) if isinstance(app_cfg, dict) else {}
@@ -61,6 +70,7 @@ def _configure_memory_engine(app_cfg: dict) -> None:
     os.environ["ASSISTANT_SYSTEM_PROMPT"] = str(llm_cfg.get("system_prompt") or "")
     os.environ["SQLITE_PATH"] = _default_sqlite_path(memory_cfg)
     os.environ["CHROMA_PATH"] = _default_chroma_path(memory_cfg)
+    os.environ["OBSIDIAN_VAULT_PATH"] = _default_obsidian_vault(memory_cfg)
 
     embed_backend = str(memory_cfg.get("embed_backend") or os.environ.get("EMBED_BACKEND") or "").strip()
     if embed_backend:

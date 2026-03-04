@@ -20,7 +20,12 @@ class Fact:
     version_created: int
     version_superseded: int | None
     status: str
-    source_event_id: int | None
+    source_event_id: int | None = None
+    importance: str = "contextual"
+    tier: str = "active"
+    created_at: float | None = None
+    last_accessed_at: float | None = None
+    access_count: int = 0
     meta: dict[str, Any] | None = None
 
 
@@ -41,6 +46,20 @@ class PlanStep:
     args: dict[str, Any] = field(default_factory=dict)
     precondition_fact_ids: list[int] = field(default_factory=list)
     reasoning: str = ""
+
+
+@dataclass(slots=True)
+class PlannerRun:
+    goal: str
+    snapshot: dict[str, Any]
+    system_prompt: str
+    user_prompt: str
+    planner_status: str
+    steps: list[PlanStep] = field(default_factory=list)
+    first_response: str = ""
+    repair_prompt: str | None = None
+    repair_response: str | None = None
+    error: str | None = None
 
 
 @dataclass(slots=True)

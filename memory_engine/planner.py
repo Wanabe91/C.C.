@@ -6,7 +6,7 @@ from typing import Any
 
 from .config import get_config
 from .llm import llm_call
-from .models import ContextSnapshot, Fact, PlanStep, Task
+from .models import ContextSnapshot, Fact, PlannerRun, PlanStep, Task
 
 PLANNER_JSON_SCHEMA = {
     "type": "object",
@@ -32,8 +32,13 @@ PLANNER_JSON_SCHEMA = {
 PLANNER_SYSTEM_PROMPT = (
     "You are the planning engine for a persistent local AI assistant.\n"
     "Output only valid JSON.\n"
-    "Allowed tools: respond, remember_fact, create_task, complete_task, noop.\n"
+    "Allowed tools: respond, remember_fact, create_task, complete_task, generate_weekly_review, noop.\n"
     "Prefer short, deterministic plans.\n"
+    "Use remember_fact for durable knowledge. For decisions, encode structured metadata such as "
+    "meta.kind='decision', meta.title, meta.context, meta.rationale, meta.alternatives, and meta.tags.\n"
+    "When using remember_fact, args may also include importance (core|contextual|transient) to control memory tiering.\n"
+    "Use generate_weekly_review to draft a weekly Markdown review from stored facts, tasks, and planner traces. "
+    "Its args may include week_start (YYYY-MM-DD), week_offset (integer weeks from current week), title, and focus.\n"
     "If the user only needs a direct answer, emit one respond step."
 )
 
@@ -65,15 +70,20 @@ def _fact_payload(fact: Fact) -> dict[str, Any]:
         "id": fact.id,
         "content": fact.content,
         "status": fact.status,
+        "importance": fact.importance,
+        "tier": fact.tier,
         "version_created": fact.version_created,
         "version_superseded": fact.version_superseded,
         "source_event_id": fact.source_event_id,
+        "created_at": fact.created_at,
+        "last_accessed_at": fact.last_accessed_at,
+        "access_count": fact.access_count,
         "meta": fact.meta,
     }
 
 
-def _planner_user_prompt(ctx: ContextSnapshot, goal: str) -> str:
-    payload = {
+def snapshot_payload(ctx: ContextSnapshot, goal: str) -> dict[str, Any]:
+    return {
         "goal": goal,
         "state_version": ctx.state_version,
         "vector_watermark": ctx.vector_watermark,
@@ -84,6 +94,10 @@ def _planner_user_prompt(ctx: ContextSnapshot, goal: str) -> str:
         "delta_facts": [_fact_payload(fact) for fact in ctx.delta_facts],
         "recent_messages": ctx.recent_messages,
     }
+
+
+def _planner_user_prompt(ctx: ContextSnapshot, goal: str) -> str:
+    payload = snapshot_payload(ctx, goal)
     return (
         "Return JSON using this exact structure:\n"
         "{\n"
@@ -97,6 +111,16 @@ def _planner_user_prompt(ctx: ContextSnapshot, goal: str) -> str:
         "}\n\n"
         f"Context:\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
     )
+
+
+def serialize_step(step: PlanStep) -> dict[str, Any]:
+    return {
+        "action": step.action,
+        "tool": step.tool,
+        "args": step.args,
+        "precondition_fact_ids": step.precondition_fact_ids,
+        "reasoning": step.reasoning,
+    }
 
 
 def _find_json_fragment(raw: str) -> str | None:
@@ -198,19 +222,52 @@ def _fallback_plan(goal: str) -> list[PlanStep]:
     ]
 
 
-def plan(ctx: ContextSnapshot, goal: str) -> list[PlanStep]:
+def plan(ctx: ContextSnapshot, goal: str) -> PlannerRun:
     prompt = _planner_user_prompt(ctx, goal)
     system_prompt = _planner_system_prompt()
+    snapshot = snapshot_payload(ctx, goal)
     first_response = llm_call(system_prompt, prompt, schema=PLANNER_JSON_SCHEMA)
     try:
-        return _parse_steps(first_response)
-    except (json.JSONDecodeError, ValueError):
+        steps = _parse_steps(first_response)
+        return PlannerRun(
+            goal=goal,
+            snapshot=snapshot,
+            system_prompt=system_prompt,
+            user_prompt=prompt,
+            planner_status="ok",
+            steps=steps,
+            first_response=first_response,
+        )
+    except (json.JSONDecodeError, ValueError) as first_error:
         repair_prompt = (
             "Repair the following output into valid JSON with the exact required structure.\n"
             f"{first_response}"
         )
         second_response = llm_call(system_prompt, repair_prompt, schema=PLANNER_JSON_SCHEMA)
         try:
-            return _parse_steps(second_response)
-        except (json.JSONDecodeError, ValueError):
-            return _fallback_plan(goal)
+            steps = _parse_steps(second_response)
+            return PlannerRun(
+                goal=goal,
+                snapshot=snapshot,
+                system_prompt=system_prompt,
+                user_prompt=prompt,
+                planner_status="repaired",
+                steps=steps,
+                first_response=first_response,
+                repair_prompt=repair_prompt,
+                repair_response=second_response,
+                error=str(first_error),
+            )
+        except (json.JSONDecodeError, ValueError) as second_error:
+            return PlannerRun(
+                goal=goal,
+                snapshot=snapshot,
+                system_prompt=system_prompt,
+                user_prompt=prompt,
+                planner_status="fallback",
+                steps=_fallback_plan(goal),
+                first_response=first_response,
+                repair_prompt=repair_prompt,
+                repair_response=second_response,
+                error=f"{first_error}; {second_error}",
+            )

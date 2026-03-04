@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 class Config:
     SQLITE_PATH: Path
     CHROMA_PATH: Path
+    OBSIDIAN_VAULT_PATH: Path
     LLM_BASE_URL: str
     LLM_MODEL: str
     ASSISTANT_SYSTEM_PROMPT: str
@@ -27,9 +28,13 @@ class Config:
     @classmethod
     def from_env(cls) -> "Config":
         load_dotenv(override=False)
+        sqlite_path = Path(os.getenv("SQLITE_PATH", "./agent_memory.db")).expanduser().resolve()
         config = cls(
-            SQLITE_PATH=Path(os.getenv("SQLITE_PATH", "./agent_memory.db")).expanduser().resolve(),
+            SQLITE_PATH=sqlite_path,
             CHROMA_PATH=Path(os.getenv("CHROMA_PATH", "./chroma_store")).expanduser().resolve(),
+            OBSIDIAN_VAULT_PATH=Path(
+                os.getenv("OBSIDIAN_VAULT_PATH", str(sqlite_path.parent / "obsidian"))
+            ).expanduser().resolve(),
             LLM_BASE_URL=os.getenv("LLM_BASE_URL", "http://localhost:1234/v1").rstrip("/"),
             LLM_MODEL=os.getenv("LLM_MODEL", "local-model"),
             ASSISTANT_SYSTEM_PROMPT=os.getenv("ASSISTANT_SYSTEM_PROMPT", "").strip(),
@@ -63,6 +68,7 @@ class Config:
     def ensure_directories(self) -> None:
         self.SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
         self.CHROMA_PATH.mkdir(parents=True, exist_ok=True)
+        self.OBSIDIAN_VAULT_PATH.mkdir(parents=True, exist_ok=True)
 
 
 @lru_cache(maxsize=1)

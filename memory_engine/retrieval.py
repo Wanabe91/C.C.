@@ -14,6 +14,7 @@ from .db import (
     get_delta_facts as get_db_delta_facts,
     get_fact_by_id,
     get_recent_messages,
+    touch_fact_accesses,
 )
 from .embeddings import embed
 from .models import ContextSnapshot, Fact, Task
@@ -202,6 +203,9 @@ def build_context_snapshot(current_version: int, vector_watermark: int, query: s
     fts_results = fts_search(query, config.MAX_CONTEXT_FACTS)
     vector_results = chroma_search(query, config.MAX_CONTEXT_FACTS, vector_watermark)
     delta_facts = get_db_delta_facts(current_version, vector_watermark)
+    touched_fact_ids = sorted({fact.id for fact in [*fts_results, *vector_results, *delta_facts]})
+    if touched_fact_ids:
+        touch_fact_accesses(touched_fact_ids)
     recent_messages = get_recent_messages(config.MAX_RECENT_MESSAGES)
     return ContextSnapshot(
         state_version=current_version,
