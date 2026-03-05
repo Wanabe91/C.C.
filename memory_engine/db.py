@@ -739,6 +739,59 @@ def list_planner_runs_for_event(event_id: int) -> list[dict[str, Any]]:
         conn.close()
 
 
+def _step_trace_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": int(row["id"]),
+        "planner_run_id": int(row["planner_run_id"]),
+        "step_index": int(row["step_index"]),
+        "action": row["action"],
+        "tool": row["tool"],
+        "args": _loads_json(row["args_json"]) or {},
+        "precondition_fact_ids": json.loads(row["precondition_fact_ids"]),
+        "reasoning": row["reasoning"],
+        "snapshot_state_version": int(row["snapshot_state_version"]),
+        "current_state_version": (
+            int(row["current_state_version"])
+            if row["current_state_version"] is not None
+            else None
+        ),
+        "revalidation_status": row["revalidation_status"],
+        "rejection_reason": row["rejection_reason"],
+        "replan_reason": row["replan_reason"] if "replan_reason" in row.keys() else None,
+        "replan_count": (
+            int(row["replan_count"])
+            if "replan_count" in row.keys() and row["replan_count"] is not None
+            else None
+        ),
+        "replan_diff_summary": _loads_json(row["replan_diff_summary"] if "replan_diff_summary" in row.keys() else None),
+        "execution_status": row["execution_status"],
+        "result": _loads_json(row["result_json"]),
+        "created_at": float(row["created_at"]),
+    }
+
+
+def list_step_traces_for_event(event_id: int) -> dict[int, list[dict[str, Any]]]:
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT st.*
+            FROM step_traces st
+            JOIN planner_runs pr ON pr.id = st.planner_run_id
+            WHERE pr.event_id = ?
+            ORDER BY st.planner_run_id ASC, st.step_index ASC, st.id ASC
+            """,
+            (event_id,),
+        ).fetchall()
+        result: dict[int, list[dict[str, Any]]] = {}
+        for row in rows:
+            run_id = int(row["planner_run_id"])
+            result.setdefault(run_id, []).append(_step_trace_from_row(row))
+        return result
+    finally:
+        conn.close()
+
+
 def list_step_traces_for_planner_run(planner_run_id: int) -> list[dict[str, Any]]:
     conn = _connect()
     try:
@@ -751,37 +804,7 @@ def list_step_traces_for_planner_run(planner_run_id: int) -> list[dict[str, Any]
             """,
             (planner_run_id,),
         ).fetchall()
-        return [
-            {
-                "id": int(row["id"]),
-                "planner_run_id": int(row["planner_run_id"]),
-                "step_index": int(row["step_index"]),
-                "action": row["action"],
-                "tool": row["tool"],
-                "args": _loads_json(row["args_json"]) or {},
-                "precondition_fact_ids": json.loads(row["precondition_fact_ids"]),
-                "reasoning": row["reasoning"],
-                "snapshot_state_version": int(row["snapshot_state_version"]),
-                "current_state_version": (
-                    int(row["current_state_version"])
-                    if row["current_state_version"] is not None
-                    else None
-                ),
-                "revalidation_status": row["revalidation_status"],
-                "rejection_reason": row["rejection_reason"],
-                "replan_reason": row["replan_reason"] if "replan_reason" in row.keys() else None,
-                "replan_count": (
-                    int(row["replan_count"])
-                    if "replan_count" in row.keys() and row["replan_count"] is not None
-                    else None
-                ),
-                "replan_diff_summary": _loads_json(row["replan_diff_summary"] if "replan_diff_summary" in row.keys() else None),
-                "execution_status": row["execution_status"],
-                "result": _loads_json(row["result_json"]),
-                "created_at": float(row["created_at"]),
-            }
-            for row in rows
-        ]
+        return [_step_trace_from_row(row) for row in rows]
     finally:
         conn.close()
 
@@ -854,10 +877,14 @@ def get_recent_messages(limit: int | None = None) -> list[dict[str, Any]]:
         conn.close()
 
 
-def get_delta_facts(current_version: int, vector_watermark: int) -> list[Fact]:
-    conn = _connect()
+def get_delta_facts(
+    current_version: int,
+    vector_watermark: int,
+    conn: sqlite3.Connection | None = None,
+) -> list[Fact]:
+    local_conn = conn if conn is not None else _connect()
     try:
-        rows = conn.execute(
+        rows = local_conn.execute(
             """
             SELECT *
             FROM facts
@@ -868,13 +895,14 @@ def get_delta_facts(current_version: int, vector_watermark: int) -> list[Fact]:
         ).fetchall()
         return [_fact_from_row(row) for row in rows if row is not None]
     finally:
-        conn.close()
+        if conn is None:
+            local_conn.close()
 
 
-def get_active_tasks() -> list[Task]:
-    conn = _connect()
+def get_active_tasks(conn: sqlite3.Connection | None = None) -> list[Task]:
+    local_conn = conn if conn is not None else _connect()
     try:
-        rows = conn.execute(
+        rows = local_conn.execute(
             """
             SELECT *
             FROM tasks
@@ -884,7 +912,8 @@ def get_active_tasks() -> list[Task]:
         ).fetchall()
         return [_task_from_row(row) for row in rows]
     finally:
-        conn.close()
+        if conn is None:
+            local_conn.close()
 
 
 def claim_pending_outbox_item() -> dict[str, Any] | None:
@@ -995,19 +1024,33 @@ def list_stale_active_facts(limit: int = 50) -> list[Fact]:
         conn.close()
 
 
-def touch_fact_accesses(fact_ids: list[int], accessed_at: float | None = None) -> None:
+def touch_fact_accesses(
+    fact_ids: list[int],
+    accessed_at: float | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> None:
     normalized_ids = sorted({int(fact_id) for fact_id in fact_ids if int(fact_id) > 0})
     if not normalized_ids:
         return
-    with db_transaction() as conn:
-        conn.execute(
-            f"""
-            UPDATE facts
-            SET last_accessed_at = ?, access_count = COALESCE(access_count, 0) + 1
-            WHERE id IN ({",".join("?" for _ in normalized_ids)})
-            """,
-            (accessed_at if accessed_at is not None else time.time(), *normalized_ids),
-        )
+    if conn is None:
+        with db_transaction() as local_conn:
+            local_conn.execute(
+                f"""
+                UPDATE facts
+                SET last_accessed_at = ?, access_count = COALESCE(access_count, 0) + 1
+                WHERE id IN ({",".join("?" for _ in normalized_ids)})
+                """,
+                (accessed_at if accessed_at is not None else time.time(), *normalized_ids),
+            )
+        return
+    conn.execute(
+        f"""
+        UPDATE facts
+        SET last_accessed_at = ?, access_count = COALESCE(access_count, 0) + 1
+        WHERE id IN ({",".join("?" for _ in normalized_ids)})
+        """,
+        (accessed_at if accessed_at is not None else time.time(), *normalized_ids),
+    )
 
 
 def _legacy_proposal_payload(row: sqlite3.Row) -> dict[str, Any] | None:

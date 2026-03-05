@@ -24,6 +24,8 @@ class Config:
     INDEXER_POLL_INTERVAL_SEC: int
     MAX_CONTEXT_FACTS: int
     MAX_RECENT_MESSAGES: int
+    COMPACTION_THRESHOLD: int = 50
+    COMPACTION_BATCH_SIZE: int = 30
     drift_policy: Literal["fingerprint", "threshold"] = "fingerprint"
     max_replans_per_event: int = 3
 
@@ -77,6 +79,8 @@ def load_config_from_env() -> Config:
         INDEXER_POLL_INTERVAL_SEC=int(os.getenv("INDEXER_POLL_INTERVAL_SEC", "2")),
         MAX_CONTEXT_FACTS=int(os.getenv("MAX_CONTEXT_FACTS", "20")),
         MAX_RECENT_MESSAGES=int(os.getenv("MAX_RECENT_MESSAGES", "10")),
+        COMPACTION_THRESHOLD=int(os.getenv("COMPACTION_THRESHOLD", "50")),
+        COMPACTION_BATCH_SIZE=int(os.getenv("COMPACTION_BATCH_SIZE", "30")),
     )
     config.validate()
     return config

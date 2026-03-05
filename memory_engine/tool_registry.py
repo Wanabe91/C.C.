@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 from datetime import date
 from typing import Any, Callable
@@ -222,6 +223,7 @@ def get_tool(name: str) -> ToolDefinition | None:
     return TOOL_REGISTRY.get(str(name or "").strip())
 
 
+@functools.lru_cache(maxsize=None)
 def registry_prompt_block() -> str:
     lines = ["Available tools:"]
     for tool_definition in TOOL_REGISTRY.values():

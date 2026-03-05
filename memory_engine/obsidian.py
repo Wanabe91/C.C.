@@ -11,7 +11,7 @@ from .db import (
     get_event_by_id,
     get_fact_record_by_id,
     list_planner_runs_for_event,
-    list_step_traces_for_planner_run,
+    list_step_traces_for_event,
 )
 
 
@@ -99,6 +99,7 @@ def write_event_note(event_id: int, assistant_messages: list[str]) -> Path | Non
     fullpath = _vault_root() / relpath
     fullpath.parent.mkdir(parents=True, exist_ok=True)
     planner_runs = list_planner_runs_for_event(event_id)
+    all_step_traces = list_step_traces_for_event(event_id)
 
     lines = [
         "---",
@@ -126,7 +127,7 @@ def write_event_note(event_id: int, assistant_messages: list[str]) -> Path | Non
 
     for run in planner_runs:
         snapshot = run.get("snapshot") or {}
-        step_traces = list_step_traces_for_planner_run(run["id"])
+        step_traces = all_step_traces.get(run["id"], [])
         lines.extend(
             [
                 f"## Planner Run {run['id']}",

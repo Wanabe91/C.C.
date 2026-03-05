@@ -1,19 +1,25 @@
 from __future__ import annotations
 
 from functools import lru_cache
-
-from sentence_transformers import SentenceTransformer
+from typing import TYPE_CHECKING, Any
 
 from .config import get_config
 from .hf_auth import configure_huggingface_auth
 from .http_client import post
 
+if TYPE_CHECKING:
+    from sentence_transformers import SentenceTransformer
+else:
+    SentenceTransformer = Any
+
 
 @lru_cache(maxsize=1)
 def _get_st_model() -> SentenceTransformer:
+    from sentence_transformers import SentenceTransformer as _SentenceTransformer
+
     config = get_config()
     configure_huggingface_auth()
-    return SentenceTransformer(config.EMBED_MODEL)
+    return _SentenceTransformer(config.EMBED_MODEL)
 
 
 def embed(text: str) -> list[float]:

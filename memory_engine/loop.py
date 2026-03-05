@@ -175,10 +175,11 @@ def extract_facts_from_result(result: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _maybe_compact_messages(llm_client: LLMClient) -> None:
-    if count_uncompacted_messages() <= 50:
+    config = get_config()
+    if count_uncompacted_messages() <= config.COMPACTION_THRESHOLD:
         return
-    rows = get_messages_for_compaction(limit=30)
-    if len(rows) < 30:
+    rows = get_messages_for_compaction(limit=config.COMPACTION_BATCH_SIZE)
+    if len(rows) < config.COMPACTION_BATCH_SIZE:
         return
     transcript = "\n".join(f"{row['role']}: {row['content']}" for row in rows)
     summary = llm_call(
@@ -798,10 +799,10 @@ async def ingest_event(
             generated_reviews.extend(result.get("generated_reviews", []))
             last_diff_summary = None
             last_fingerprint_diff_signature = None
-            _maybe_compact_messages(llm_client)
             if await interrupt.check():
                 return assistant_messages
             step_index += 1
+        _maybe_compact_messages(llm_client)
         return assistant_messages
     finally:
         for fact_id in decision_fact_ids:

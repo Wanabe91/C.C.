@@ -12,7 +12,7 @@ from .db import (
     _fact_from_row,
     get_active_tasks as get_persisted_active_tasks,
     get_delta_facts as get_db_delta_facts,
-    get_fact_by_id,
+    get_fact_rows_for_ids,
     get_recent_messages,
     touch_fact_accesses,
 )
@@ -25,6 +25,44 @@ _collection_lock = Lock()
 _vector_store_disabled = False
 _vector_store_disable_reason = ""
 logger = logging.getLogger(__name__)
+
+_FTS_STOPWORDS = {
+    "и",
+    "в",
+    "на",
+    "с",
+    "по",
+    "к",
+    "а",
+    "но",
+    "что",
+    "это",
+    "я",
+    "не",
+    "он",
+    "она",
+    "они",
+    "мы",
+    "вы",
+    "то",
+    "как",
+    "the",
+    "a",
+    "an",
+    "is",
+    "in",
+    "on",
+    "at",
+    "to",
+    "of",
+    "for",
+    "and",
+    "or",
+    "not",
+    "it",
+    "be",
+    "do",
+}
 
 
 class MemoryEmbeddingFunction:
@@ -122,18 +160,24 @@ def get_collection():
 
 
 def _fts_query(query: str) -> str:
-    tokens = list(dict.fromkeys(re.findall(r"\w+", query.lower())))
+    tokens = list(
+        dict.fromkeys(
+            t
+            for t in re.findall(r"\w+", query.lower())
+            if t not in _FTS_STOPWORDS
+        )
+    )
     return " OR ".join(f"{token}*" for token in tokens[:8])
 
 
-def fts_search(query: str, n: int | None = None) -> list[Fact]:
+def fts_search(query: str, n: int | None = None, conn=None) -> list[Fact]:
     resolved_n = n or get_config().MAX_CONTEXT_FACTS
     fts_query_text = _fts_query(query)
     if not fts_query_text:
         return []
-    conn = _connect()
+    local_conn = conn if conn is not None else _connect()
     try:
-        rows = conn.execute(
+        rows = local_conn.execute(
             """
             SELECT f.*
             FROM facts_fts
@@ -146,7 +190,8 @@ def fts_search(query: str, n: int | None = None) -> list[Fact]:
         ).fetchall()
         return [_fact_from_row(row) for row in rows if row is not None]
     finally:
-        conn.close()
+        if conn is None:
+            local_conn.close()
 
 
 def chroma_search(query: str, n: int | None = None, vector_watermark: int = 0) -> list[Fact]:
@@ -163,24 +208,46 @@ def chroma_search(query: str, n: int | None = None, vector_watermark: int = 0) -
         include=["documents", "metadatas", "distances"],
     )
     metadatas = (results.get("metadatas") or [[]])[0]
+    ordered_fact_ids: list[int] = []
     seen: set[int] = set()
-    facts: list[Fact] = []
     for metadata in metadatas:
         if not metadata:
             continue
-        fact_id = int(metadata.get("fact_id", 0))
+        try:
+            fact_id = int(metadata.get("fact_id", 0))
+        except (TypeError, ValueError):
+            continue
+        if fact_id <= 0:
+            continue
         if fact_id in seen:
             continue
-        fact = get_fact_by_id(fact_id)
+        seen.add(fact_id)
+        ordered_fact_ids.append(fact_id)
+    if not ordered_fact_ids:
+        return []
+
+    conn = _connect()
+    try:
+        db_facts = get_fact_rows_for_ids(conn, ordered_fact_ids)
+    finally:
+        conn.close()
+
+    facts_by_id = {fact.id: fact for fact in db_facts}
+    facts: list[Fact] = []
+    for fact_id in ordered_fact_ids:
+        fact = facts_by_id.get(fact_id)
         if fact is None or fact.status != "active":
             continue
-        seen.add(fact_id)
         facts.append(fact)
     return facts
 
 
-def get_delta_facts(current_version: int, vector_watermark: int) -> list[Fact]:
-    return get_db_delta_facts(current_version, vector_watermark)
+def get_delta_facts(
+    current_version: int,
+    vector_watermark: int,
+    conn=None,
+) -> list[Fact]:
+    return get_db_delta_facts(current_version, vector_watermark, conn=conn)
 
 
 def get_pinned_facts(conn) -> list[Fact]:
@@ -233,18 +300,23 @@ def _build_fact_versions(facts: list[Fact]) -> dict[str, tuple[int, str, str]]:
     return {str(fact.id): _fact_fingerprint_tuple(fact) for fact in facts}
 
 
-def build_context_fingerprint(facts: list[Fact], active_task_ids: set[str]) -> ContextFingerprint:
-    conn = _connect()
+def build_context_fingerprint(
+    facts: list[Fact],
+    active_task_ids: set[str],
+    conn=None,
+) -> ContextFingerprint:
+    local_conn = conn if conn is not None else _connect()
     try:
         return ContextFingerprint(
             fact_versions=_build_fact_versions(facts),
             active_task_ids=set(active_task_ids),
-            last_summary_id=_load_last_entity_id(conn, "summaries"),
-            last_message_id=_load_last_entity_id(conn, "messages"),
+            last_summary_id=_load_last_entity_id(local_conn, "summaries"),
+            last_message_id=_load_last_entity_id(local_conn, "messages"),
             # vector_watermark is excluded because index lag is async bookkeeping, not semantic drift.
         )
     finally:
-        conn.close()
+        if conn is None:
+            local_conn.close()
 
 
 def refresh_context_fingerprint(snapshot_fingerprint: ContextFingerprint) -> ContextFingerprint:
@@ -317,31 +389,45 @@ def build_context_snapshot(
     conn = _connect()
     try:
         pinned_facts = get_pinned_facts(conn)
+        pinned_fact_ids = {fact.id for fact in pinned_facts}
+        persisted_tasks = get_persisted_active_tasks(conn=conn)
+        transient_tasks = working_memory.get_active_tasks()
+        constraints = working_memory.get_constraints()
+        fts_results = [
+            fact
+            for fact in fts_search(query, config.MAX_CONTEXT_FACTS, conn=conn)
+            if fact.id not in pinned_fact_ids
+        ]
+        vector_results = [
+            fact
+            for fact in chroma_search(query, config.MAX_CONTEXT_FACTS, vector_watermark)
+            if fact.id not in pinned_fact_ids
+        ]
+        delta_facts = get_db_delta_facts(current_version, vector_watermark, conn=conn)
+        all_context_facts = [*pinned_facts, *fts_results, *vector_results, *delta_facts]
+        seen_ids: set[int] = set()
+        deduped: list[Fact] = []
+        for fact in all_context_facts:
+            if fact.id not in seen_ids:
+                seen_ids.add(fact.id)
+                deduped.append(fact)
+        all_context_facts = deduped
+        touched_fact_ids = sorted({fact.id for fact in all_context_facts})
+        if touched_fact_ids:
+            touch_fact_accesses(touched_fact_ids, conn=conn)
+        fingerprint = build_context_fingerprint(
+            all_context_facts,
+            {str(task.id) for task in persisted_tasks if task.status == "active"},
+            conn=conn,
+        )
     finally:
         conn.close()
-
-    pinned_fact_ids = {fact.id for fact in pinned_facts}
-    persisted_tasks = get_persisted_active_tasks()
-    transient_tasks = working_memory.get_active_tasks()
-    constraints = working_memory.get_constraints()
-    fts_results = [fact for fact in fts_search(query, config.MAX_CONTEXT_FACTS) if fact.id not in pinned_fact_ids]
-    vector_results = [
-        fact for fact in chroma_search(query, config.MAX_CONTEXT_FACTS, vector_watermark) if fact.id not in pinned_fact_ids
-    ]
-    delta_facts = get_db_delta_facts(current_version, vector_watermark)
-    all_context_facts = [*pinned_facts, *fts_results, *vector_results, *delta_facts]
-    touched_fact_ids = sorted({fact.id for fact in all_context_facts})
-    if touched_fact_ids:
-        touch_fact_accesses(touched_fact_ids)
     recent_messages = get_recent_messages(config.MAX_RECENT_MESSAGES)
     return ContextSnapshot(
         state_version=current_version,
         event_version=event_version,
         vector_watermark=vector_watermark,
-        fingerprint=build_context_fingerprint(
-            all_context_facts,
-            {str(task.id) for task in persisted_tasks if task.status == "active"},
-        ),
+        fingerprint=fingerprint,
         tasks=_merge_tasks(persisted_tasks, transient_tasks),
         constraints=constraints,
         fts_results=fts_results,
