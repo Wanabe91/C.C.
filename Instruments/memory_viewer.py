@@ -167,22 +167,91 @@ with tab_sqlite:
                 with col_right:
                     search_term = st.text_input("🔎 Поиск по содержимому (LIKE)", placeholder="Введи текст...", key="sqlite_search")
                     limit = st.slider("Строк", 10, min(500, max(10, row_count)), 50, key="sqlite_limit")
+                    is_facts_table = selected_table == "facts" and "meta_json" in col_names
+                    kind_options = ["user_model", "preference", "project_context", "user_fact", "(none)"]
+
+                    selected_kinds = kind_options
+                    show_only_pinned = False
+                    if is_facts_table:
+                        c_kind, c_pin = st.columns([3, 2])
+                        with c_kind:
+                            selected_kinds = st.multiselect(
+                                "kind",
+                                options=kind_options,
+                                default=kind_options,
+                                key="facts_kind_filter",
+                            )
+                        with c_pin:
+                            show_only_pinned = st.checkbox("Show only pinned", value=False, key="facts_only_pinned")
+
+                    text_cols = [n for n, t in zip(col_names, col_types)
+                                 if "TEXT" in t.upper() or "CHAR" in t.upper() or t == ""]
+                    where_clauses = []
+                    params = []
 
                     if search_term:
-                        text_cols = [n for n, t in zip(col_names, col_types)
-                                     if "TEXT" in t.upper() or "CHAR" in t.upper() or t == ""]
                         if text_cols:
-                            like_clauses = " OR ".join([f"[{c}] LIKE ?" for c in text_cols])
-                            params = [f"%{search_term}%"] * len(text_cols)
-                            df = pd.read_sql_query(
-                                f"SELECT * FROM [{selected_table}] WHERE {like_clauses} LIMIT {limit}",
-                                conn, params=params)
-                            st.caption(f"Найдено: {len(df)} строк по «{search_term}»")
+                            like_clauses = [f"[{c}] LIKE ?" for c in text_cols]
+                            params.extend([f"%{search_term}%"] * len(text_cols))
+                            if is_facts_table:
+                                like_clauses.append("json_extract([meta_json], '$.kind') LIKE ?")
+                                params.append(f"%{search_term}%")
+                            where_clauses.append("(" + " OR ".join(like_clauses) + ")")
                         else:
-                            df = pd.read_sql_query(f"SELECT * FROM [{selected_table}] LIMIT {limit}", conn)
                             st.warning("Текстовых колонок не найдено")
+
+                    if is_facts_table:
+                        kind_expr = "json_extract([meta_json], '$.kind')"
+
+                        if selected_kinds != kind_options:
+                            if not selected_kinds:
+                                where_clauses.append("1 = 0")
+                            else:
+                                kind_parts = []
+                                non_empty_kinds = [k for k in selected_kinds if k != "(none)"]
+                                if non_empty_kinds:
+                                    placeholders = ", ".join(["?"] * len(non_empty_kinds))
+                                    kind_parts.append(f"{kind_expr} IN ({placeholders})")
+                                    params.extend(non_empty_kinds)
+                                if "(none)" in selected_kinds:
+                                    kind_parts.append(f"({kind_expr} IS NULL OR {kind_expr} = '')")
+                                where_clauses.append("(" + " OR ".join(kind_parts) + ")")
+
+                        if show_only_pinned:
+                            where_clauses.append(f"{kind_expr} IN ('user_model', 'preference')")
+
+                        select_cols = []
+                        if "id" in col_names:
+                            select_cols.append("[id]")
+                        select_cols.append("json_extract([meta_json], '$.kind') AS kind")
+                        if "content" in col_names:
+                            select_cols.append("[content]")
+                        select_cols.extend([f"[{c}]" for c in col_names if c not in {"id", "content"}])
+                        select_sql = ", ".join(select_cols)
                     else:
-                        df = pd.read_sql_query(f"SELECT * FROM [{selected_table}] LIMIT {limit}", conn)
+                        select_sql = "*"
+
+                    query_sql = f"SELECT {select_sql} FROM [{selected_table}]"
+                    if where_clauses:
+                        query_sql += " WHERE " + " AND ".join(where_clauses)
+                    query_sql += f" LIMIT {limit}"
+
+                    df = pd.read_sql_query(query_sql, conn, params=params)
+
+                    if search_term and text_cols:
+                        st.caption(f"Найдено: {len(df)} строк по «{search_term}»")
+
+                    if is_facts_table and "kind" in df.columns:
+                        pinned_kinds = {"user_model", "preference"}
+
+                        def format_kind(value):
+                            if pd.isna(value) or value == "":
+                                return "(none)"
+                            if value in pinned_kinds:
+                                return f"📌 {value}"
+                            return value
+
+                        df["kind"] = df["kind"].apply(format_kind)
 
                     st.dataframe(df, use_container_width=True, height=380)
                     st.download_button("⬇️ CSV", df.to_csv(index=False).encode("utf-8"),

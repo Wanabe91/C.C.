@@ -43,6 +43,7 @@ MAX_REPLANS_PER_EVENT = 3
 SAFE_REPLAN_FALLBACK_MESSAGE = (
     "I hit repeated context changes while working on that, so I'm stopping here instead of looping."
 )
+_PINNED_FACT_KINDS = {"user_model", "preference"}
 
 
 def extract_goal(raw: dict[str, Any]) -> str:
@@ -111,7 +112,56 @@ def _normalize_source_fact_ids(value: Any) -> list[int]:
     return normalized_ids
 
 
-def _reject_proposal(conn: Any, proposal_id: int) -> None:
+def _proposal_referenced_fact_ids(proposal: dict[str, Any]) -> list[int]:
+    proposal_type = str(proposal.get("type") or "").strip()
+    if proposal_type == "merge":
+        try:
+            return _normalize_source_fact_ids(proposal.get("source_fact_ids"))
+        except (TypeError, ValueError):
+            return []
+    if proposal_type == "tier_change":
+        try:
+            fact_id = int(proposal.get("fact_id"))
+        except (TypeError, ValueError):
+            return []
+        return [fact_id] if fact_id > 0 else []
+    return []
+
+
+def _is_pinned_fact_kind(meta: dict[str, Any] | None) -> bool:
+    if not isinstance(meta, dict):
+        return False
+    kind = str(meta.get("kind") or "").strip().lower()
+    return kind in _PINNED_FACT_KINDS
+
+
+def _reject_proposal(
+    conn: Any,
+    proposal_id: int,
+    *,
+    reason: str | None = None,
+    proposal: dict[str, Any] | None = None,
+    affected_fact_id: int | None = None,
+) -> None:
+    # consolidation_proposals.status has no DB CHECK constraint; 'rejected' is already part of runtime lifecycle.
+    if reason and isinstance(proposal, dict):
+        updated_proposal = dict(proposal)
+        meta = updated_proposal.get("meta")
+        updated_meta = dict(meta) if isinstance(meta, dict) else {}
+        updated_meta["reason"] = reason
+        updated_meta["rejection_reason"] = reason
+        if affected_fact_id is not None:
+            updated_meta["affected_fact_id"] = int(affected_fact_id)
+        updated_proposal["meta"] = updated_meta
+        conn.execute(
+            """
+            UPDATE consolidation_proposals
+            SET status = 'rejected', proposal_json = ?
+            WHERE id = ?
+            """,
+            (json.dumps(updated_proposal, ensure_ascii=False), proposal_id),
+        )
+        return
     conn.execute(
         "UPDATE consolidation_proposals SET status = 'rejected' WHERE id = ?",
         (proposal_id,),
@@ -265,6 +315,26 @@ def apply_pending_proposals(version: int) -> int:
                 _reject_proposal(conn, proposal_record["id"])
             continue
         with db_transaction() as conn:
+            referenced_fact_ids = _proposal_referenced_fact_ids(proposal)
+            referenced_facts = get_fact_rows_for_ids(conn, referenced_fact_ids) if referenced_fact_ids else []
+            pinned_fact = next(
+                (fact for fact in referenced_facts if _is_pinned_fact_kind(fact.meta)),
+                None,
+            )
+            if pinned_fact is not None:
+                _reject_proposal(
+                    conn,
+                    proposal_record["id"],
+                    reason="pinned_fact_protected",
+                    proposal=proposal,
+                    affected_fact_id=pinned_fact.id,
+                )
+                logger.warning(
+                    "Proposal %s rejected: affects pinned fact %s",
+                    proposal_record["id"],
+                    pinned_fact.id,
+                )
+                continue
             proposal_type = str(proposal.get("type") or "").strip()
             if proposal_type == "merge":
                 applied += int(_apply_merge_proposal(conn, proposal_record, proposal, version))

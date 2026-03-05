@@ -160,3 +160,15 @@ class ContextSnapshot:
     vector_results: list[Fact]
     delta_facts: list[Fact]
     recent_messages: list[dict[str, Any]]
+    pinned_facts: list[Fact] = field(default_factory=list)
+
+    @property
+    def facts(self) -> list[Fact]:
+        merged: list[Fact] = []
+        seen_fact_ids: set[int] = set()
+        for fact in [*self.pinned_facts, *self.fts_results, *self.vector_results, *self.delta_facts]:
+            if fact.id in seen_fact_ids:
+                continue
+            seen_fact_ids.add(fact.id)
+            merged.append(fact)
+        return merged

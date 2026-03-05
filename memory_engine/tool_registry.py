@@ -6,6 +6,7 @@ from typing import Any, Callable
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
+from .identity import CORE
 from .weekly_review import generate_weekly_review
 
 
@@ -118,12 +119,20 @@ def _handle_respond(args: RespondArgs) -> dict[str, Any]:
 
 def _handle_remember_fact(args: RememberFactArgs) -> dict[str, Any]:
     result = _base_result("remember_fact")
+    kind = CORE.classify_memory_request(args.content)
+    if kind == "core_attack":
+        result["assistant_message"] = (
+            "I cannot store that memory request because it attempts to override core identity rules."
+        )
+        return result
+    meta = dict(args.meta or {})
+    meta["kind"] = kind
     result["facts"] = [
         {
             "content": args.content,
             "importance": args.importance,
             "tier": args.tier,
-            "meta": dict(args.meta or {}),
+            "meta": meta,
         }
     ]
     return result

@@ -9,12 +9,12 @@ from typing import Any
 
 from .config import get_config
 from .db import (
+    _connect,
+    _fact_from_row,
     insert_consolidation_proposal,
     list_pending_proposal_signatures,
-    list_recent_active_facts,
-    list_stale_active_facts,
 )
-from .llm import llm_call
+from .llm import LLMRequest, llm_call
 from .models import Fact
 
 logger = logging.getLogger(__name__)
@@ -141,18 +141,62 @@ def _append_unique_facts(
             return
 
 
+def _list_recent_candidate_facts(limit: int) -> list[Fact]:
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM facts
+            WHERE status = 'active'
+              AND (
+                json_extract(meta_json, '$.kind') IS NULL
+                OR json_extract(meta_json, '$.kind') NOT IN ('user_model', 'preference')
+              )
+            ORDER BY version_created DESC, id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [_fact_from_row(row) for row in rows if row is not None]
+    finally:
+        conn.close()
+
+
+def _list_stale_candidate_facts(limit: int) -> list[Fact]:
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM facts
+            WHERE status = 'active'
+              AND (
+                json_extract(meta_json, '$.kind') IS NULL
+                OR json_extract(meta_json, '$.kind') NOT IN ('user_model', 'preference')
+              )
+            ORDER BY COALESCE(last_accessed_at, created_at, 0) ASC, created_at ASC, id ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [_fact_from_row(row) for row in rows if row is not None]
+    finally:
+        conn.close()
+
+
 def _candidate_facts(limit: int) -> list[Fact]:
     recent_limit = max(limit // 2, 1)
     stale_limit = max(limit - recent_limit, 1)
-    recent = list_recent_active_facts(limit=recent_limit)
-    stale = list_stale_active_facts(limit=stale_limit)
+    recent = _list_recent_candidate_facts(limit=recent_limit)
+    stale = _list_stale_candidate_facts(limit=stale_limit)
     merged: list[Fact] = []
     seen: set[int] = set()
     for batch in (
         recent,
         stale,
-        list_recent_active_facts(limit=max(limit, 1)),
-        list_stale_active_facts(limit=max(limit, 1)),
+        _list_recent_candidate_facts(limit=max(limit, 1)),
+        _list_stale_candidate_facts(limit=max(limit, 1)),
     ):
         _append_unique_facts(merged, seen, batch, limit=limit)
         if len(merged) >= limit:
@@ -290,8 +334,11 @@ def _proposal_sort_key(proposal: dict[str, Any]) -> tuple[int, int]:
 
 def _propose_memory_optimizations(facts: list[Fact]) -> list[dict[str, Any]]:
     raw = llm_call(
-        TIERING_SYSTEM_PROMPT,
-        _tiering_user_prompt(facts),
+        LLMRequest(
+            goal=_tiering_user_prompt(facts),
+            context_snapshot="",
+            tool_registry_block=TIERING_SYSTEM_PROMPT,
+        ),
         schema=TIERING_RESPONSE_SCHEMA,
     )
     return _parse_proposals(raw)

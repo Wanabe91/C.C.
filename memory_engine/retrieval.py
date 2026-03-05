@@ -183,6 +183,19 @@ def get_delta_facts(current_version: int, vector_watermark: int) -> list[Fact]:
     return get_db_delta_facts(current_version, vector_watermark)
 
 
+def get_pinned_facts(conn) -> list[Fact]:
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM facts
+        WHERE status = 'active'
+          AND json_extract(meta_json, '$.kind') IN ('user_model', 'preference')
+        ORDER BY importance DESC, last_accessed_at DESC
+        """
+    ).fetchall()
+    return [_fact_from_row(row) for row in rows if row is not None]
+
+
 def _merge_tasks(persisted_tasks: list[Task], transient_tasks: list[Task]) -> list[Task]:
     merged: list[Task] = []
     seen: set[tuple[int, str]] = set()
@@ -301,13 +314,22 @@ def build_context_snapshot(
     query: str,
 ) -> ContextSnapshot:
     config = get_config()
+    conn = _connect()
+    try:
+        pinned_facts = get_pinned_facts(conn)
+    finally:
+        conn.close()
+
+    pinned_fact_ids = {fact.id for fact in pinned_facts}
     persisted_tasks = get_persisted_active_tasks()
     transient_tasks = working_memory.get_active_tasks()
     constraints = working_memory.get_constraints()
-    fts_results = fts_search(query, config.MAX_CONTEXT_FACTS)
-    vector_results = chroma_search(query, config.MAX_CONTEXT_FACTS, vector_watermark)
+    fts_results = [fact for fact in fts_search(query, config.MAX_CONTEXT_FACTS) if fact.id not in pinned_fact_ids]
+    vector_results = [
+        fact for fact in chroma_search(query, config.MAX_CONTEXT_FACTS, vector_watermark) if fact.id not in pinned_fact_ids
+    ]
     delta_facts = get_db_delta_facts(current_version, vector_watermark)
-    all_context_facts = [*fts_results, *vector_results, *delta_facts]
+    all_context_facts = [*pinned_facts, *fts_results, *vector_results, *delta_facts]
     touched_fact_ids = sorted({fact.id for fact in all_context_facts})
     if touched_fact_ids:
         touch_fact_accesses(touched_fact_ids)
@@ -326,4 +348,5 @@ def build_context_snapshot(
         vector_results=vector_results,
         delta_facts=delta_facts,
         recent_messages=recent_messages,
+        pinned_facts=pinned_facts,
     )

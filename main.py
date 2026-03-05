@@ -3,7 +3,6 @@ import asyncio
 import yaml
 from memory_engine.hf_auth import configure_huggingface_auth
 
-
 configure_huggingface_auth()
 
 # from utils.event_bus import EventBus
@@ -12,7 +11,6 @@ configure_huggingface_auth()
 # from modules.vision import VisionModule
 from modules.planner import Planner
 
-EXIT_COMMANDS = {"exit", "выход"}
 
 
 
@@ -45,7 +43,7 @@ class PersonalAI:
             inp = input("You: ").strip()
             if not inp:
                 continue
-            if inp.lower() in EXIT_COMMANDS:
+            if inp.lower() in ("exit", "\u0432\u044b\u0445\u043e\u0434"):
                 break
             try:
                 print(f"AI: {await self._on_text(inp)}\n")

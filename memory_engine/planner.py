@@ -7,7 +7,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from .config import get_config
-from .llm import llm_call
+from .llm import LLMRequest, llm_call
 from .models import ContextSnapshot, Fact, PlannerRun, Task, ValidatedPlanStep
 from .tool_registry import registry_prompt_block
 
@@ -69,12 +69,11 @@ def _planner_validation_code(message: str) -> str:
 
 
 def _planner_system_prompt() -> str:
-    planner_prompt = f"{PLANNER_SYSTEM_PROMPT_PREFIX}\n{registry_prompt_block()}"
     assistant_prompt = get_config().ASSISTANT_SYSTEM_PROMPT
     if not assistant_prompt:
-        return planner_prompt
+        return PLANNER_SYSTEM_PROMPT_PREFIX
     return (
-        f"{planner_prompt}\n"
+        f"{PLANNER_SYSTEM_PROMPT_PREFIX}\n"
         "When emitting a respond step, follow this assistant style instruction:\n"
         f"{assistant_prompt}"
     )
@@ -118,12 +117,12 @@ def snapshot_payload(ctx: ContextSnapshot, goal: str) -> dict[str, Any]:
         "fts_results": [_fact_payload(fact) for fact in ctx.fts_results],
         "vector_results": [_fact_payload(fact) for fact in ctx.vector_results],
         "delta_facts": [_fact_payload(fact) for fact in ctx.delta_facts],
+        "pinned_facts": [_fact_payload(fact) for fact in ctx.pinned_facts],
         "recent_messages": ctx.recent_messages,
     }
 
 
-def _planner_user_prompt(ctx: ContextSnapshot, goal: str) -> str:
-    payload = snapshot_payload(ctx, goal)
+def _planner_user_prompt(goal: str) -> str:
     return (
         "Return JSON using this exact structure:\n"
         "{\n"
@@ -135,8 +134,61 @@ def _planner_user_prompt(ctx: ContextSnapshot, goal: str) -> str:
         '    "reasoning": "string"\n'
         "  }]\n"
         "}\n\n"
-        f"Context:\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
+        f"Goal:\n{goal.strip()}"
     )
+
+
+def _fact_kind(fact: Fact) -> str:
+    meta = fact.meta if isinstance(fact.meta, dict) else {}
+    return str(meta.get("kind") or "").strip().lower()
+
+
+def _snapshot_facts(ctx: ContextSnapshot) -> list[Fact]:
+    explicit_facts = getattr(ctx, "facts", None)
+    if isinstance(explicit_facts, list):
+        facts = [fact for fact in explicit_facts if isinstance(fact, Fact)]
+    else:
+        facts = [*ctx.fts_results, *ctx.vector_results, *ctx.delta_facts]
+
+    deduplicated: list[Fact] = []
+    seen_fact_ids: set[int] = set()
+    for fact in facts:
+        if fact.id in seen_fact_ids:
+            continue
+        seen_fact_ids.add(fact.id)
+        deduplicated.append(fact)
+    return deduplicated
+
+
+def _split_pinned_facts(ctx: ContextSnapshot) -> tuple[list[Fact], list[Fact]]:
+    user_model_facts: list[Fact] = []
+    preference_facts: list[Fact] = []
+    for fact in ctx.pinned_facts:
+        kind = _fact_kind(fact)
+        if kind == "user_model":
+            user_model_facts.append(fact)
+        elif kind == "preference":
+            preference_facts.append(fact)
+    return user_model_facts, preference_facts
+
+
+def _facts_to_block(facts: list[Fact]) -> str:
+    if not facts:
+        return ""
+    return json.dumps([_fact_payload(fact) for fact in facts], ensure_ascii=False, indent=2)
+
+
+def _planner_context_snapshot(ctx: ContextSnapshot, goal: str, context_facts: list[Fact]) -> str:
+    payload = {
+        "goal": goal,
+        "state_version": ctx.state_version,
+        "vector_watermark": ctx.vector_watermark,
+        "tasks": [_task_payload(task) for task in ctx.tasks],
+        "constraints": ctx.constraints,
+        "facts": [_fact_payload(fact) for fact in context_facts],
+        "recent_messages": ctx.recent_messages,
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 def serialize_step(step: ValidatedPlanStep) -> dict[str, Any]:
@@ -261,10 +313,19 @@ def _repair_prompt(raw_response: str, error_message: str) -> str:
 
 
 def plan(ctx: ContextSnapshot, goal: str) -> PlannerRun:
-    prompt = _planner_user_prompt(ctx, goal)
+    prompt = _planner_user_prompt(goal)
     system_prompt = _planner_system_prompt()
     snapshot = snapshot_payload(ctx, goal)
-    first_response = llm_call(system_prompt, prompt, schema=PLANNER_JSON_SCHEMA)
+    user_model_facts, preference_facts = _split_pinned_facts(ctx)
+    context_facts = _snapshot_facts(ctx)
+    request = LLMRequest(
+        goal=prompt,
+        context_snapshot=_planner_context_snapshot(ctx, goal, context_facts),
+        tool_registry_block=f"{system_prompt}\n{registry_prompt_block()}".strip(),
+        user_model=_facts_to_block(user_model_facts),
+        preferences=_facts_to_block(preference_facts),
+    )
+    first_response = llm_call(request, schema=PLANNER_JSON_SCHEMA)
     try:
         steps = _parse_steps(first_response)
         return PlannerRun(
@@ -278,7 +339,15 @@ def plan(ctx: ContextSnapshot, goal: str) -> PlannerRun:
         )
     except (json.JSONDecodeError, PlannerValidationError, ValueError) as first_error:
         repair_prompt = _repair_prompt(first_response, str(first_error))
-        second_response = llm_call(system_prompt, repair_prompt, schema=PLANNER_JSON_SCHEMA)
+        repair_request = LLMRequest(
+            goal=repair_prompt,
+            context_snapshot=request.context_snapshot,
+            tool_registry_block=request.tool_registry_block,
+            user_model=request.user_model,
+            preferences=request.preferences,
+            identity=request.identity,
+        )
+        second_response = llm_call(repair_request, schema=PLANNER_JSON_SCHEMA)
         try:
             steps = _parse_steps(second_response)
             return PlannerRun(
