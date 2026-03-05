@@ -1,4 +1,4 @@
-# Veronia Repository Review Map
+# Repository Review Map
 
 This document describes the repository as it exists in code, with emphasis on execution flow, state changes, and module boundaries. It is meant to answer "how the current code works", not "how to run it".
 
