@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 from . import planner
@@ -30,7 +31,7 @@ from .db import (
 )
 from .executor import execute_step
 from .interrupt import InterruptChannel
-from .llm import llm_call
+from .llm import LLMClient, llm_call
 from .models import ContextSnapshot, FingerprintDiff, ValidatedPlanStep
 from .obsidian import write_decision_note, write_event_note, write_weekly_review
 from .retrieval import build_context_snapshot, fingerprint_diff, refresh_context_fingerprint
@@ -44,6 +45,104 @@ SAFE_REPLAN_FALLBACK_MESSAGE = (
     "I hit repeated context changes while working on that, so I'm stopping here instead of looping."
 )
 _PINNED_FACT_KINDS = {"user_model", "preference"}
+
+
+@dataclass
+class ReplanResult:
+    """Описывает что нужно изменить в цикле ingest_event после replan."""
+
+    new_steps: list[ValidatedPlanStep] | None
+    new_snapshot: ContextSnapshot | None
+    new_planner_run_id: int | None
+    drift_checks_frozen: bool
+    last_fingerprint_diff_signature: str | None
+
+
+def _handle_replan(
+    *,
+    event_id: int,
+    raw_text: str,
+    goal: str,
+    replan_count: int,
+    max_replans_per_event: int,
+    snapshot: ContextSnapshot,
+    step: ValidatedPlanStep,
+    step_index: int,
+    planner_run_id: int,
+    cur_V: int,
+    replan_reason: str,
+    diff_summary: dict[str, Any],
+    proposal_application_enabled: bool,
+    llm_client: LLMClient,
+) -> tuple[int, ReplanResult]:
+    """
+    Единая точка обработки replan для любой из причин:
+      precondition_changed | threshold_exceeded | context_fingerprint_changed
+
+    Возвращает (обновлённый replan_count, ReplanResult).
+    Не мутирует переданные аргументы.
+    """
+    if replan_count >= max_replans_per_event:
+        logger.warning(
+            "max_replans_per_event_reached %s",
+            json.dumps(
+                {
+                    "event_id": event_id,
+                    "replan_count": replan_count,
+                    "replan_reason": replan_reason,
+                    "replan_diff_summary": diff_summary,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+        )
+        _trace_replan(
+            planner_run_id=planner_run_id,
+            step_index=step_index,
+            step=step,
+            snapshot_state_version=snapshot.state_version,
+            current_state_version=cur_V,
+            revalidation_status="replan_limit_reached",
+            replan_reason=replan_reason,
+            replan_count=replan_count,
+            replan_diff_summary=diff_summary,
+        )
+        return replan_count, ReplanResult(
+            new_steps=[_safe_fallback_step()],
+            new_snapshot=None,
+            new_planner_run_id=None,
+            drift_checks_frozen=True,
+            last_fingerprint_diff_signature=None,
+        )
+
+    new_replan_count = replan_count + 1
+    _trace_replan(
+        planner_run_id=planner_run_id,
+        step_index=step_index,
+        step=step,
+        snapshot_state_version=snapshot.state_version,
+        current_state_version=cur_V,
+        revalidation_status="replanned",
+        replan_reason=replan_reason,
+        replan_count=new_replan_count,
+        replan_diff_summary=diff_summary,
+    )
+    current_event_version = get_event_version()
+    new_snapshot = _build_snapshot(
+        cur_V,
+        current_event_version,
+        raw_text,
+        apply_proposals=proposal_application_enabled,
+    )
+    new_plan_run = planner.plan(new_snapshot, goal, llm_client=llm_client)
+    new_planner_run_id = _persist_planner_run(event_id, new_plan_run)
+    return new_replan_count, ReplanResult(
+        new_steps=new_plan_run.steps,
+        new_snapshot=new_snapshot,
+        new_planner_run_id=new_planner_run_id,
+        drift_checks_frozen=False,
+        last_fingerprint_diff_signature=None,
+    )
 
 
 def extract_goal(raw: dict[str, Any]) -> str:
@@ -75,7 +174,7 @@ def extract_facts_from_result(result: dict[str, Any]) -> list[dict[str, Any]]:
     return facts
 
 
-def _maybe_compact_messages() -> None:
+def _maybe_compact_messages(llm_client: LLMClient) -> None:
     if count_uncompacted_messages() <= 50:
         return
     rows = get_messages_for_compaction(limit=30)
@@ -85,6 +184,7 @@ def _maybe_compact_messages() -> None:
     summary = llm_call(
         "Summarize these older assistant messages for future planning. Preserve durable facts and open commitments.",
         transcript,
+        client=llm_client,
     )
     create_summary_and_mark_messages([row["id"] for row in rows], summary)
 
@@ -474,7 +574,12 @@ def _safe_fallback_step() -> ValidatedPlanStep:
     )
 
 
-async def ingest_event(raw: dict[str, Any], interrupt: InterruptChannel) -> list[str]:
+async def ingest_event(
+    raw: dict[str, Any],
+    interrupt: InterruptChannel,
+    *,
+    llm_client: LLMClient,
+) -> list[str]:
     raw_text = str(raw.get("text") or "").strip()
     config = get_config()
     assistant_messages: list[str] = []
@@ -498,7 +603,7 @@ async def ingest_event(raw: dict[str, Any], interrupt: InterruptChannel) -> list
         apply_proposals=proposal_application_enabled,
     )
     goal = extract_goal(raw)
-    plan_run = planner.plan(snapshot, goal)
+    plan_run = planner.plan(snapshot, goal, llm_client=llm_client)
     planner_run_id = _persist_planner_run(event_id, plan_run)
     steps = plan_run.steps
     replan_count = 0
@@ -519,60 +624,31 @@ async def ingest_event(raw: dict[str, Any], interrupt: InterruptChannel) -> list
                     replan_reason = "precondition_changed"
                     diff_summary = _precondition_diff_summary(precondition_changes)
                     last_diff_summary = diff_summary
-                    if replan_count >= max_replans_per_event:
-                        logger.warning(
-                            "max_replans_per_event_reached %s",
-                            json.dumps(
-                                {
-                                    "event_id": event_id,
-                                    "replan_count": replan_count,
-                                    "replan_reason": replan_reason,
-                                    "replan_diff_summary": diff_summary,
-                                },
-                                ensure_ascii=False,
-                                sort_keys=True,
-                            ),
-                        )
-                        _trace_replan(
-                            planner_run_id=planner_run_id,
-                            step_index=step_index,
-                            step=step,
-                            snapshot_state_version=snapshot.state_version,
-                            current_state_version=cur_V,
-                            revalidation_status="replan_limit_reached",
-                            replan_reason=replan_reason,
-                            replan_count=replan_count,
-                            replan_diff_summary=diff_summary,
-                        )
-                        steps = [_safe_fallback_step()]
-                        step_index = 0
-                        drift_checks_frozen = True
-                        last_fingerprint_diff_signature = None
-                        continue
-                    replan_count += 1
-                    _trace_replan(
-                        planner_run_id=planner_run_id,
-                        step_index=step_index,
-                        step=step,
-                        snapshot_state_version=snapshot.state_version,
-                        current_state_version=cur_V,
-                        revalidation_status="replanned",
-                        replan_reason=replan_reason,
+                    replan_count, _r = _handle_replan(
+                        event_id=event_id,
+                        raw_text=raw_text,
+                        goal=goal,
                         replan_count=replan_count,
-                        replan_diff_summary=diff_summary,
+                        max_replans_per_event=max_replans_per_event,
+                        snapshot=snapshot,
+                        step=step,
+                        step_index=step_index,
+                        planner_run_id=planner_run_id,
+                        cur_V=cur_V,
+                        replan_reason=replan_reason,
+                        diff_summary=diff_summary,
+                        proposal_application_enabled=proposal_application_enabled,
+                        llm_client=llm_client,
                     )
-                    current_event_version = get_event_version()
-                    snapshot = _build_snapshot(
-                        cur_V,
-                        current_event_version,
-                        raw_text,
-                        apply_proposals=proposal_application_enabled,
-                    )
-                    plan_run = planner.plan(snapshot, goal)
-                    planner_run_id = _persist_planner_run(event_id, plan_run)
-                    steps = plan_run.steps
-                    step_index = 0
-                    last_fingerprint_diff_signature = None
+                    if _r.new_steps is not None:
+                        steps = _r.new_steps
+                        step_index = 0
+                    if _r.new_snapshot is not None:
+                        snapshot = _r.new_snapshot
+                    if _r.new_planner_run_id is not None:
+                        planner_run_id = _r.new_planner_run_id
+                    drift_checks_frozen = _r.drift_checks_frozen
+                    last_fingerprint_diff_signature = _r.last_fingerprint_diff_signature
                     continue
 
                 if config.drift_policy == "threshold":
@@ -588,60 +664,31 @@ async def ingest_event(raw: dict[str, Any], interrupt: InterruptChannel) -> list
                             "threshold": config.VERSION_DRIFT_THRESHOLD,
                         }
                         last_diff_summary = diff_summary
-                        if replan_count >= max_replans_per_event:
-                            logger.warning(
-                                "max_replans_per_event_reached %s",
-                                json.dumps(
-                                    {
-                                        "event_id": event_id,
-                                        "replan_count": replan_count,
-                                        "replan_reason": replan_reason,
-                                        "replan_diff_summary": diff_summary,
-                                    },
-                                    ensure_ascii=False,
-                                    sort_keys=True,
-                                ),
-                            )
-                            _trace_replan(
-                                planner_run_id=planner_run_id,
-                                step_index=step_index,
-                                step=step,
-                                snapshot_state_version=snapshot.state_version,
-                                current_state_version=cur_V,
-                                revalidation_status="replan_limit_reached",
-                                replan_reason=replan_reason,
-                                replan_count=replan_count,
-                                replan_diff_summary=diff_summary,
-                            )
-                            steps = [_safe_fallback_step()]
-                            step_index = 0
-                            drift_checks_frozen = True
-                            last_fingerprint_diff_signature = None
-                            continue
-                        replan_count += 1
-                        _trace_replan(
-                            planner_run_id=planner_run_id,
-                            step_index=step_index,
-                            step=step,
-                            snapshot_state_version=snapshot.state_version,
-                            current_state_version=cur_V,
-                            revalidation_status="replanned",
-                            replan_reason=replan_reason,
+                        replan_count, _r = _handle_replan(
+                            event_id=event_id,
+                            raw_text=raw_text,
+                            goal=goal,
                             replan_count=replan_count,
-                            replan_diff_summary=diff_summary,
+                            max_replans_per_event=max_replans_per_event,
+                            snapshot=snapshot,
+                            step=step,
+                            step_index=step_index,
+                            planner_run_id=planner_run_id,
+                            cur_V=cur_V,
+                            replan_reason=replan_reason,
+                            diff_summary=diff_summary,
+                            proposal_application_enabled=proposal_application_enabled,
+                            llm_client=llm_client,
                         )
-                        current_event_version = get_event_version()
-                        snapshot = _build_snapshot(
-                            cur_V,
-                            current_event_version,
-                            raw_text,
-                            apply_proposals=proposal_application_enabled,
-                        )
-                        plan_run = planner.plan(snapshot, goal)
-                        planner_run_id = _persist_planner_run(event_id, plan_run)
-                        steps = plan_run.steps
-                        step_index = 0
-                        last_fingerprint_diff_signature = None
+                        if _r.new_steps is not None:
+                            steps = _r.new_steps
+                            step_index = 0
+                        if _r.new_snapshot is not None:
+                            snapshot = _r.new_snapshot
+                        if _r.new_planner_run_id is not None:
+                            planner_run_id = _r.new_planner_run_id
+                        drift_checks_frozen = _r.drift_checks_frozen
+                        last_fingerprint_diff_signature = _r.last_fingerprint_diff_signature
                         continue
                 else:
                     current_event_version = get_event_version()
@@ -680,59 +727,33 @@ async def ingest_event(raw: dict[str, Any], interrupt: InterruptChannel) -> list
                                     ),
                                 )
                             else:
-                                if replan_count >= max_replans_per_event:
-                                    logger.warning(
-                                        "max_replans_per_event_reached %s",
-                                        json.dumps(
-                                            {
-                                                "event_id": event_id,
-                                                "replan_count": replan_count,
-                                                "replan_reason": replan_reason,
-                                                "replan_diff_summary": diff_summary,
-                                            },
-                                            ensure_ascii=False,
-                                            sort_keys=True,
-                                        ),
-                                    )
-                                    _trace_replan(
-                                        planner_run_id=planner_run_id,
-                                        step_index=step_index,
-                                        step=step,
-                                        snapshot_state_version=snapshot.state_version,
-                                        current_state_version=cur_V,
-                                        revalidation_status="replan_limit_reached",
-                                        replan_reason=replan_reason,
-                                        replan_count=replan_count,
-                                        replan_diff_summary=diff_summary,
-                                    )
-                                    steps = [_safe_fallback_step()]
-                                    step_index = 0
-                                    drift_checks_frozen = True
-                                    last_fingerprint_diff_signature = None
-                                    continue
-                                replan_count += 1
-                                _trace_replan(
-                                    planner_run_id=planner_run_id,
-                                    step_index=step_index,
-                                    step=step,
-                                    snapshot_state_version=snapshot.state_version,
-                                    current_state_version=cur_V,
-                                    revalidation_status="replanned",
-                                    replan_reason=replan_reason,
+                                replan_count, _r = _handle_replan(
+                                    event_id=event_id,
+                                    raw_text=raw_text,
+                                    goal=goal,
                                     replan_count=replan_count,
-                                    replan_diff_summary=diff_summary,
+                                    max_replans_per_event=max_replans_per_event,
+                                    snapshot=snapshot,
+                                    step=step,
+                                    step_index=step_index,
+                                    planner_run_id=planner_run_id,
+                                    cur_V=cur_V,
+                                    replan_reason=replan_reason,
+                                    diff_summary=diff_summary,
+                                    proposal_application_enabled=proposal_application_enabled,
+                                    llm_client=llm_client,
                                 )
-                                snapshot = _build_snapshot(
-                                    cur_V,
-                                    current_event_version,
-                                    raw_text,
-                                    apply_proposals=proposal_application_enabled,
+                                if _r.new_steps is not None:
+                                    steps = _r.new_steps
+                                    step_index = 0
+                                if _r.new_snapshot is not None:
+                                    snapshot = _r.new_snapshot
+                                if _r.new_planner_run_id is not None:
+                                    planner_run_id = _r.new_planner_run_id
+                                drift_checks_frozen = _r.drift_checks_frozen
+                                last_fingerprint_diff_signature = (
+                                    diff_signature if not _r.drift_checks_frozen else None
                                 )
-                                plan_run = planner.plan(snapshot, goal)
-                                planner_run_id = _persist_planner_run(event_id, plan_run)
-                                steps = plan_run.steps
-                                step_index = 0
-                                last_fingerprint_diff_signature = diff_signature
                                 continue
                         else:
                             snapshot.event_version = current_event_version
@@ -777,7 +798,7 @@ async def ingest_event(raw: dict[str, Any], interrupt: InterruptChannel) -> list
             generated_reviews.extend(result.get("generated_reviews", []))
             last_diff_summary = None
             last_fingerprint_diff_signature = None
-            _maybe_compact_messages()
+            _maybe_compact_messages(llm_client)
             if await interrupt.check():
                 return assistant_messages
             step_index += 1

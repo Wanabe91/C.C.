@@ -14,7 +14,7 @@ from .db import (
     insert_consolidation_proposal,
     list_pending_proposal_signatures,
 )
-from .llm import LLMRequest, llm_call
+from .llm import LLMClient, LLMRequest, llm_call
 from .models import Fact
 
 logger = logging.getLogger(__name__)
@@ -195,8 +195,7 @@ def _candidate_facts(limit: int) -> list[Fact]:
     for batch in (
         recent,
         stale,
-        _list_recent_candidate_facts(limit=max(limit, 1)),
-        _list_stale_candidate_facts(limit=max(limit, 1)),
+        _list_recent_candidate_facts(limit=max(limit, 1))
     ):
         _append_unique_facts(merged, seen, batch, limit=limit)
         if len(merged) >= limit:
@@ -332,7 +331,11 @@ def _proposal_sort_key(proposal: dict[str, Any]) -> tuple[int, int]:
     return (2, 0)
 
 
-def _propose_memory_optimizations(facts: list[Fact]) -> list[dict[str, Any]]:
+def _propose_memory_optimizations(
+    facts: list[Fact],
+    *,
+    llm_client: LLMClient,
+) -> list[dict[str, Any]]:
     raw = llm_call(
         LLMRequest(
             goal=_tiering_user_prompt(facts),
@@ -340,6 +343,7 @@ def _propose_memory_optimizations(facts: list[Fact]) -> list[dict[str, Any]]:
             tool_registry_block=TIERING_SYSTEM_PROMPT,
         ),
         schema=TIERING_RESPONSE_SCHEMA,
+        client=llm_client,
     )
     return _parse_proposals(raw)
 
@@ -351,7 +355,7 @@ async def _wait_or_stop(stop_event: asyncio.Event, seconds: float) -> None:
         return
 
 
-async def run_consolidator(stop_event: asyncio.Event) -> None:
+async def run_consolidator(stop_event: asyncio.Event, *, llm_client: LLMClient) -> None:
     config = get_config()
     while not stop_event.is_set():
         try:
@@ -360,7 +364,7 @@ async def run_consolidator(stop_event: asyncio.Event) -> None:
             if facts:
                 facts_by_id = {fact.id: fact for fact in facts}
                 pending_signatures = list_pending_proposal_signatures()
-                proposals = _propose_memory_optimizations(facts)
+                proposals = _propose_memory_optimizations(facts, llm_client=llm_client)
                 created_signatures: set[tuple[str, ...]] = set()
                 for raw_proposal in sorted(proposals, key=_proposal_sort_key):
                     proposal = _normalize_proposal(raw_proposal, facts_by_id)

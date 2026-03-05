@@ -7,7 +7,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from .config import get_config
-from .llm import LLMRequest, llm_call
+from .llm import LLMClient, LLMRequest, llm_call
 from .models import ContextSnapshot, Fact, PlannerRun, Task, ValidatedPlanStep
 from .tool_registry import registry_prompt_block
 
@@ -312,7 +312,7 @@ def _repair_prompt(raw_response: str, error_message: str) -> str:
     )
 
 
-def plan(ctx: ContextSnapshot, goal: str) -> PlannerRun:
+def plan(ctx: ContextSnapshot, goal: str, *, llm_client: LLMClient) -> PlannerRun:
     prompt = _planner_user_prompt(goal)
     system_prompt = _planner_system_prompt()
     snapshot = snapshot_payload(ctx, goal)
@@ -325,7 +325,7 @@ def plan(ctx: ContextSnapshot, goal: str) -> PlannerRun:
         user_model=_facts_to_block(user_model_facts),
         preferences=_facts_to_block(preference_facts),
     )
-    first_response = llm_call(request, schema=PLANNER_JSON_SCHEMA)
+    first_response = llm_call(request, schema=PLANNER_JSON_SCHEMA, client=llm_client)
     try:
         steps = _parse_steps(first_response)
         return PlannerRun(
@@ -347,7 +347,11 @@ def plan(ctx: ContextSnapshot, goal: str) -> PlannerRun:
             preferences=request.preferences,
             identity=request.identity,
         )
-        second_response = llm_call(repair_request, schema=PLANNER_JSON_SCHEMA)
+        second_response = llm_call(
+            repair_request,
+            schema=PLANNER_JSON_SCHEMA,
+            client=llm_client,
+        )
         try:
             steps = _parse_steps(second_response)
             return PlannerRun(

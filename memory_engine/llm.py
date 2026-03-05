@@ -5,7 +5,6 @@ from typing import Any
 
 import httpx
 
-from .config import get_config
 from .http_client import post
 from .identity import CORE, IdentityCore
 
@@ -17,7 +16,11 @@ class LMStudioError(Exception):
         self.body = body
 
 
-_JSON_RESPONSE_FORMAT_SUPPORTED: bool | None = None
+@dataclass(slots=True)
+class LLMClient:
+    base_url: str
+    model: str
+    json_response_format_supported: bool | None = None
 
 
 @dataclass(slots=True)
@@ -51,11 +54,10 @@ class LLMRequest:
         return messages
 
 
-def _post_chat(payload: dict[str, Any]) -> str:
-    config = get_config()
+def _post_chat(client: LLMClient, payload: dict[str, Any]) -> str:
     try:
         response = post(
-            f"{config.LLM_BASE_URL}/chat/completions",
+            f"{client.base_url}/chat/completions",
             json=payload,
             headers={"Content-Type": "application/json"},
             timeout=120.0,
@@ -76,9 +78,12 @@ def _post_chat(payload: dict[str, Any]) -> str:
     return content.strip()
 
 
-def llm_call(request: LLMRequest | str, schema: dict[str, Any] | str | None = None) -> str:
-    global _JSON_RESPONSE_FORMAT_SUPPORTED
-
+def llm_call(
+    request: LLMRequest | str,
+    schema: dict[str, Any] | str | None = None,
+    *,
+    client: LLMClient,
+) -> str:
     resolved_request: LLMRequest
     resolved_schema: dict[str, Any] | None
     if isinstance(request, LLMRequest):
@@ -98,34 +103,33 @@ def llm_call(request: LLMRequest | str, schema: dict[str, Any] | str | None = No
         )
         resolved_schema = None
 
-    config = get_config()
     messages: list[dict[str, str]] = resolved_request.build_messages()
     payload = {
-        "model": config.LLM_MODEL,
+        "model": client.model,
         "messages": messages,
         "temperature": 0,
     }
     if resolved_schema is None:
         try:
-            return _post_chat(payload)
+            return _post_chat(client, payload)
         except LMStudioError as exc:
             raise RuntimeError(
                 f"LM Studio request failed with HTTP {exc.status_code}: {exc.body}"
             ) from exc
 
-    if _JSON_RESPONSE_FORMAT_SUPPORTED is not False:
+    if client.json_response_format_supported is not False:
         first_payload = dict(payload)
         first_payload["response_format"] = {"type": "json_object"}
         try:
-            response = _post_chat(first_payload)
-            _JSON_RESPONSE_FORMAT_SUPPORTED = True
+            response = _post_chat(client, first_payload)
+            client.json_response_format_supported = True
             return response
         except LMStudioError as exc:
             if exc.status_code != 400:
                 raise RuntimeError(
                     f"LM Studio request failed with HTTP {exc.status_code}: {exc.body}"
                 ) from exc
-            _JSON_RESPONSE_FORMAT_SUPPORTED = False
+            client.json_response_format_supported = False
 
     repair_messages = [dict(message) for message in messages]
     last_user_index = next(
@@ -154,12 +158,12 @@ def llm_call(request: LLMRequest | str, schema: dict[str, Any] | str | None = No
     else:
         repair_messages.append(repaired_user_message)
     repair_payload = {
-        "model": config.LLM_MODEL,
+        "model": client.model,
         "messages": repair_messages,
         "temperature": 0,
     }
     try:
-        return _post_chat(repair_payload)
+        return _post_chat(client, repair_payload)
     except LMStudioError as retry_exc:
         raise RuntimeError(
             f"LM Studio request failed with HTTP {retry_exc.status_code}: {retry_exc.body}"

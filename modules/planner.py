@@ -8,6 +8,7 @@ from memory_engine.consolidator import run_consolidator
 from memory_engine.db import init_db
 from memory_engine.indexer import run_indexer
 from memory_engine.interrupt import InterruptChannel
+from memory_engine.llm import LLMClient
 from memory_engine.loop import ingest_event
 from memory_engine.tool_registry import assert_registry_integrity
 
@@ -92,7 +93,12 @@ def _build_memory_engine_config(app_cfg: dict) -> Config:
 class Planner:
     def __init__(self, app_cfg: dict | None = None):
         self.app_cfg = app_cfg or {}
-        set_active_config(_build_memory_engine_config(self.app_cfg))
+        memory_cfg = _build_memory_engine_config(self.app_cfg)
+        set_active_config(memory_cfg)
+        self._llm_client = LLMClient(
+            base_url=memory_cfg.LLM_BASE_URL,
+            model=memory_cfg.LLM_MODEL,
+        )
         assert_registry_integrity()
         init_db()
 
@@ -107,12 +113,19 @@ class Planner:
         self._stop_event = asyncio.Event()
         self._workers = [
             asyncio.create_task(run_indexer(self._stop_event), name="memory-indexer"),
-            asyncio.create_task(run_consolidator(self._stop_event), name="memory-consolidator"),
+            asyncio.create_task(
+                run_consolidator(self._stop_event, llm_client=self._llm_client),
+                name="memory-consolidator",
+            ),
         ]
 
     async def run(self, user_input: str) -> str:
         await self._ensure_workers()
-        responses = await ingest_event({"text": user_input}, self._interrupt)
+        responses = await ingest_event(
+            {"text": user_input},
+            self._interrupt,
+            llm_client=self._llm_client,
+        )
         if not responses:
             return "No assistant response was produced."
         return "\n".join(item for item in responses if item)
