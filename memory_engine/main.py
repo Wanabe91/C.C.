@@ -11,7 +11,6 @@ from .consolidator import run_consolidator
 from .db import init_db
 from .indexer import run_indexer
 from .interrupt import InterruptChannel
-from .llm import LLMClient
 from .loop import ingest_event
 from .tool_registry import assert_registry_integrity
 
@@ -72,20 +71,19 @@ async def start() -> None:
     set_active_config(cfg)
     assert_registry_integrity()
     init_db()
-    llm_client = LLMClient(base_url=cfg.LLM_BASE_URL, model=cfg.LLM_MODEL)
     stop_event = asyncio.Event()
     interrupt = InterruptChannel()
     workers = [
         asyncio.create_task(run_indexer(stop_event), name="memory-indexer"),
         asyncio.create_task(
-            run_consolidator(stop_event, llm_client=llm_client),
+            run_consolidator(stop_event),
             name="memory-consolidator",
         ),
     ]
 
     try:
         for raw in await _collect_events():
-            await ingest_event(raw, interrupt, llm_client=llm_client)
+            await ingest_event(raw, interrupt)
     finally:
         stop_event.set()
         await _shutdown_workers(workers)

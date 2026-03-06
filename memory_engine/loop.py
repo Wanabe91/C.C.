@@ -31,7 +31,7 @@ from .db import (
 )
 from .executor import execute_step
 from .interrupt import InterruptChannel
-from .llm import LLMClient, llm_call
+from .llm import llm_call
 from .models import ContextSnapshot, FingerprintDiff, ValidatedPlanStep
 from .obsidian import write_decision_note, write_event_note, write_weekly_review
 from .retrieval import build_context_snapshot, fingerprint_diff, refresh_context_fingerprint
@@ -73,7 +73,6 @@ def _handle_replan(
     replan_reason: str,
     diff_summary: dict[str, Any],
     proposal_application_enabled: bool,
-    llm_client: LLMClient,
 ) -> tuple[int, ReplanResult]:
     """
     Единая точка обработки replan для любой из причин:
@@ -134,7 +133,7 @@ def _handle_replan(
         raw_text,
         apply_proposals=proposal_application_enabled,
     )
-    new_plan_run = planner.plan(new_snapshot, goal, llm_client=llm_client)
+    new_plan_run = planner.plan(new_snapshot, goal)
     new_planner_run_id = _persist_planner_run(event_id, new_plan_run)
     return new_replan_count, ReplanResult(
         new_steps=new_plan_run.steps,
@@ -174,7 +173,7 @@ def extract_facts_from_result(result: dict[str, Any]) -> list[dict[str, Any]]:
     return facts
 
 
-def _maybe_compact_messages(llm_client: LLMClient) -> None:
+def _maybe_compact_messages() -> None:
     config = get_config()
     if count_uncompacted_messages() <= config.COMPACTION_THRESHOLD:
         return
@@ -185,7 +184,6 @@ def _maybe_compact_messages(llm_client: LLMClient) -> None:
     summary = llm_call(
         "Summarize these older assistant messages for future planning. Preserve durable facts and open commitments.",
         transcript,
-        client=llm_client,
     )
     create_summary_and_mark_messages([row["id"] for row in rows], summary)
 
@@ -578,8 +576,6 @@ def _safe_fallback_step() -> ValidatedPlanStep:
 async def ingest_event(
     raw: dict[str, Any],
     interrupt: InterruptChannel,
-    *,
-    llm_client: LLMClient,
 ) -> list[str]:
     raw_text = str(raw.get("text") or "").strip()
     config = get_config()
@@ -604,7 +600,7 @@ async def ingest_event(
         apply_proposals=proposal_application_enabled,
     )
     goal = extract_goal(raw)
-    plan_run = planner.plan(snapshot, goal, llm_client=llm_client)
+    plan_run = planner.plan(snapshot, goal)
     planner_run_id = _persist_planner_run(event_id, plan_run)
     steps = plan_run.steps
     replan_count = 0
@@ -639,7 +635,6 @@ async def ingest_event(
                         replan_reason=replan_reason,
                         diff_summary=diff_summary,
                         proposal_application_enabled=proposal_application_enabled,
-                        llm_client=llm_client,
                     )
                     if _r.new_steps is not None:
                         steps = _r.new_steps
@@ -679,7 +674,6 @@ async def ingest_event(
                             replan_reason=replan_reason,
                             diff_summary=diff_summary,
                             proposal_application_enabled=proposal_application_enabled,
-                            llm_client=llm_client,
                         )
                         if _r.new_steps is not None:
                             steps = _r.new_steps
@@ -742,7 +736,6 @@ async def ingest_event(
                                     replan_reason=replan_reason,
                                     diff_summary=diff_summary,
                                     proposal_application_enabled=proposal_application_enabled,
-                                    llm_client=llm_client,
                                 )
                                 if _r.new_steps is not None:
                                     steps = _r.new_steps
@@ -802,7 +795,7 @@ async def ingest_event(
             if await interrupt.check():
                 return assistant_messages
             step_index += 1
-        _maybe_compact_messages(llm_client)
+        _maybe_compact_messages()
         return assistant_messages
     finally:
         for fact_id in decision_fact_ids:

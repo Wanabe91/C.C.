@@ -4,7 +4,6 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -14,10 +13,7 @@ class Config:
     SQLITE_PATH: Path
     CHROMA_PATH: Path
     OBSIDIAN_VAULT_PATH: Path
-    LLM_BASE_URL: str
-    LLM_MODEL: str
     ASSISTANT_SYSTEM_PROMPT: str
-    EMBED_BACKEND: str
     EMBED_MODEL: str
     VERSION_DRIFT_THRESHOLD: int
     CONSOLIDATION_INTERVAL_SEC: int
@@ -30,17 +26,10 @@ class Config:
     max_replans_per_event: int = 3
 
     def validate(self) -> None:
-        parsed = urlparse(self.LLM_BASE_URL)
-        if not parsed.scheme or not parsed.netloc:
-            raise ValueError(f"Invalid LLM_BASE_URL: {self.LLM_BASE_URL}")
         if self.CHROMA_PATH == self.SQLITE_PATH:
             raise ValueError("CHROMA_PATH must not point to the SQLite file.")
         if self.CHROMA_PATH == self.SQLITE_PATH.parent:
             raise ValueError("CHROMA_PATH must be a separate directory from SQLite.")
-        if self.EMBED_BACKEND not in {"sentence_transformers", "lmstudio"}:
-            raise ValueError(
-                "EMBED_BACKEND must be 'sentence_transformers' or 'lmstudio'."
-            )
         if self.drift_policy not in {"fingerprint", "threshold"}:
             raise ValueError("drift_policy must be 'fingerprint' or 'threshold'.")
         if self.max_replans_per_event < 1:
@@ -64,10 +53,7 @@ def load_config_from_env() -> Config:
         OBSIDIAN_VAULT_PATH=Path(
             os.getenv("OBSIDIAN_VAULT_PATH", str(sqlite_path.parent / "obsidian"))
         ).expanduser().resolve(),
-        LLM_BASE_URL=os.getenv("LLM_BASE_URL", "http://localhost:1234/v1").rstrip("/"),
-        LLM_MODEL=os.getenv("LLM_MODEL", "local-model"),
         ASSISTANT_SYSTEM_PROMPT=os.getenv("ASSISTANT_SYSTEM_PROMPT", "").strip(),
-        EMBED_BACKEND=os.getenv("EMBED_BACKEND", "sentence_transformers").strip().lower(),
         EMBED_MODEL=os.getenv(
             "EMBED_MODEL",
             "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",

@@ -1,19 +1,30 @@
 llm:
-  base_url: "http://localhost:1234/v1"   # порт LM Studio по умолчанию
-  model: "local-model"                    # LM Studio игнорирует это поле, но оно обязательно
-  api_key: ""                             # не нужен
+  default_task: "fast"
   system_prompt: "Ты персональный ИИ-ассистент. Твои ответы всегда сдержаны и жестко логичны."
-  max_tokens: 1024
-  temperature: 0.7
+  temperature: 0.3
+  max_tokens: 2048
+  providers:
+    groq:
+      model: "groq/llama-3.3-70b-versatile"
+      enabled: true
+    claude:
+      model: "claude-sonnet-4-6"
+      enabled: true
+    openai_gpt4o:
+      model: "gpt-4o"
+      enabled: true
+    openai_o3:
+      model: "o3-mini"
+      enabled: false
 
 stt:
-  engine: "whisper"   # whisper | vosk
+  engine: "whisper"
   model_size: "base"
   language: "ru"
   device: "cpu"
 
 tts:
-  engine: "pyttsx3"   # pyttsx3 | edge-tts
+  engine: "pyttsx3"
 
 vision:
   enabled: false
@@ -27,8 +38,7 @@ memory:
   episodic_db: "data/episodic"
   obsidian_vault: "data/obsidian"
   profile_path: "data/profile.json"
-  embed_backend: "lmstudio"
-  embed_model: "text-embedding-sts-multilingual-mpnet-base-v2"
+  embed_model: "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 
 planner:
   max_steps: 10

@@ -8,16 +8,8 @@ from memory_engine.consolidator import run_consolidator
 from memory_engine.db import init_db
 from memory_engine.indexer import run_indexer
 from memory_engine.interrupt import InterruptChannel
-from memory_engine.llm import LLMClient
 from memory_engine.loop import ingest_event
 from memory_engine.tool_registry import assert_registry_integrity
-
-
-def _normalize_llm_base_url(raw_url: str) -> str:
-    value = (raw_url or "").strip().rstrip("/")
-    if value.endswith("/chat/completions"):
-        return value[: -len("/chat/completions")]
-    return value
 
 
 def _default_sqlite_path(memory_cfg: dict) -> str:
@@ -74,10 +66,7 @@ def _build_memory_engine_config(app_cfg: dict) -> Config:
         SQLITE_PATH=sqlite_path,
         CHROMA_PATH=Path(_default_chroma_path(memory_cfg)).expanduser().resolve(),
         OBSIDIAN_VAULT_PATH=Path(_default_obsidian_vault(memory_cfg)).expanduser().resolve(),
-        LLM_BASE_URL=_normalize_llm_base_url(str(llm_cfg.get("base_url") or "http://localhost:1234/v1")),
-        LLM_MODEL=str(llm_cfg.get("model") or "local-model"),
         ASSISTANT_SYSTEM_PROMPT=str(llm_cfg.get("system_prompt") or ""),
-        EMBED_BACKEND=str(memory_cfg.get("embed_backend") or "sentence_transformers").strip().lower(),
         EMBED_MODEL=str(
             memory_cfg.get("embed_model")
             or "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
@@ -95,10 +84,6 @@ class Planner:
         self.app_cfg = app_cfg or {}
         memory_cfg = _build_memory_engine_config(self.app_cfg)
         set_active_config(memory_cfg)
-        self._llm_client = LLMClient(
-            base_url=memory_cfg.LLM_BASE_URL,
-            model=memory_cfg.LLM_MODEL,
-        )
         assert_registry_integrity()
         init_db()
 
@@ -114,7 +99,7 @@ class Planner:
         self._workers = [
             asyncio.create_task(run_indexer(self._stop_event), name="memory-indexer"),
             asyncio.create_task(
-                run_consolidator(self._stop_event, llm_client=self._llm_client),
+                run_consolidator(self._stop_event),
                 name="memory-consolidator",
             ),
         ]
@@ -124,7 +109,6 @@ class Planner:
         responses = await ingest_event(
             {"text": user_input},
             self._interrupt,
-            llm_client=self._llm_client,
         )
         if not responses:
             return "No assistant response was produced."
