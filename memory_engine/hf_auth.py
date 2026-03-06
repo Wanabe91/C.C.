@@ -4,7 +4,6 @@ import os
 
 from dotenv import load_dotenv
 
-
 def configure_huggingface_auth() -> None:
     load_dotenv(override=False)
     token = (os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN") or "").strip()

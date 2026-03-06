@@ -39,7 +39,9 @@ PLANNER_SYSTEM_PROMPT_PREFIX = (
     "You are the planning engine for a persistent local AI assistant.\n"
     "Output only valid JSON.\n"
     "Prefer short, deterministic plans.\n"
-    "If the user only needs a direct answer, emit one respond step."
+    "If the user only needs a direct answer, emit one respond step.\n"
+    "CRITICAL: The message in any respond step MUST be written in the same "
+    "language as the user's goal. If the user wrote in Russian — respond in Russian."
 )
 
 
@@ -75,7 +77,9 @@ def _planner_system_prompt() -> str:
     return (
         f"{PLANNER_SYSTEM_PROMPT_PREFIX}\n"
         "When emitting a respond step, follow this assistant style instruction:\n"
-        f"{assistant_prompt}"
+        f"{assistant_prompt}\n"
+        "Regardless of the language facts are stored in, always reply in the "
+        "language the user used in their goal."
     )
 
 
@@ -287,9 +291,9 @@ def _parse_steps(raw: str) -> list[ValidatedPlanStep]:
 
 def _fallback_plan(goal: str) -> list[ValidatedPlanStep]:
     message = (
-        "I need a bit more detail to continue."
+        "Уточни запрос, пожалуйста."
         if not goal.strip()
-        else "I couldn't produce a structured response for that request. Please try again."
+        else "Не удалось сформировать ответ. Я туплю."
     )
     return [
         ValidatedPlanStep.model_validate(

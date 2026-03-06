@@ -12,8 +12,6 @@ configure_huggingface_auth()
 from modules.planner import Planner
 
 
-
-
 class PersonalAI:
     def __init__(self, config):
         self.planner = Planner(config)
