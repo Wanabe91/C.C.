@@ -27,13 +27,23 @@ stt:
   device: "cpu"
 
 tts:
-  engine: "pyttsx3"
+  enabled: false
+  engine: "elevenlabs"
+  voice_id: ""
+  model_id: "eleven_multilingual_v2"
+  output_format: "wav_22050"
+  playback: true
+  save_audio: true
+  save_dir: "data/tts"
 
 vision:
   enabled: false
   camera_index: 0
   frame_interval: 30
   model: "yolov8n"
+  stream_llm_interval_sec: 3.0
+  stream_status_interval_sec: 0.5
+  stream_show_window: true
 
 memory:
   short_term_limit: 20

@@ -13,6 +13,7 @@ click==8.3.1
 colorama==0.4.6
 distro==1.9.0
 durationpy==0.10
+elevenlabs==2.38.1
 filelock==3.25.0
 flatbuffers==25.12.19
 fsspec==2026.2.0
@@ -42,6 +43,7 @@ networkx==3.6.1
 numpy==2.4.2
 oauthlib==3.3.1
 onnxruntime==1.24.2
+opencv-python>=4.10.0
 opentelemetry-api==1.39.1
 opentelemetry-exporter-otlp-proto-common==1.39.1
 opentelemetry-exporter-otlp-proto-grpc==1.39.1
@@ -89,6 +91,7 @@ typer==0.24.1
 typer-slim==0.24.0
 typing-inspection==0.4.2
 typing_extensions==4.15.0
+ultralytics>=8.3.0
 urllib3==2.6.3
 uvicorn==0.41.0
 watchfiles==1.1.1

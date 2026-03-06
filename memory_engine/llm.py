@@ -63,10 +63,11 @@ class LLMRequest:
     tool_registry_block: str
     user_model: str = ""
     preferences: str = ""
+    image_data_urls: tuple[str, ...] = ()
     identity: IdentityCore = field(default_factory=lambda: CORE)
 
-    def build_messages(self) -> list[dict[str, str]]:
-        messages: list[dict[str, str]] = []
+    def build_messages(self) -> list[dict[str, Any]]:
+        messages: list[dict[str, Any]] = []
         identity_block = self.identity.as_system_block().strip()
         if identity_block:
             messages.append({"role": "system", "content": identity_block})
@@ -83,7 +84,21 @@ class LLMRequest:
         if context_snapshot:
             messages.append({"role": "system", "content": f"Context snapshot:\n{context_snapshot}"})
         goal = self.goal.strip()
-        messages.append({"role": "user", "content": goal or " "})
+        image_data_urls = tuple(url.strip() for url in self.image_data_urls if isinstance(url, str) and url.strip())
+        if image_data_urls:
+            content: list[dict[str, Any]] = [{"type": "text", "text": goal or " "}]
+            for image_url in image_data_urls:
+                content.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": image_url,
+                        },
+                    }
+                )
+            messages.append({"role": "user", "content": content})
+        else:
+            messages.append({"role": "user", "content": goal or " "})
         return messages
 
 
@@ -98,6 +113,7 @@ def llm_call(
 ) -> str:
     resolved_request, resolved_schema = _resolve_request(request, schema)
     requested_task = _normalize_task(task, resolved_request, resolved_schema)
+    has_image = has_image or bool(resolved_request.image_data_urls)
     effective_task = route(
         requested_task,
         context_len=context_len,
@@ -226,27 +242,55 @@ def _infer_task_from_request(
 
 
 def _messages_with_schema(
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     schema: dict[str, Any] | str,
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     schema_prompt = (
         "Return valid JSON only.\n"
         f"Required shape: {_schema_text(schema)}"
     )
     updated = [dict(message) for message in messages]
     if updated and updated[-1].get("role") == "user":
-        existing = updated[-1].get("content", "").strip()
-        updated[-1]["content"] = f"{schema_prompt}\n\n{existing}" if existing else schema_prompt
+        existing = updated[-1].get("content", "")
+        if isinstance(existing, str):
+            existing = existing.strip()
+            updated[-1]["content"] = f"{schema_prompt}\n\n{existing}" if existing else schema_prompt
+            return updated
+        if isinstance(existing, list):
+            merged_content: list[dict[str, Any]] = []
+            inserted_schema = False
+            for item in existing:
+                if (
+                    not inserted_schema
+                    and isinstance(item, dict)
+                    and item.get("type") == "text"
+                    and isinstance(item.get("text"), str)
+                ):
+                    current_text = item["text"].strip()
+                    merged_content.append(
+                        {
+                            **item,
+                            "text": f"{schema_prompt}\n\n{current_text}" if current_text else schema_prompt,
+                        }
+                    )
+                    inserted_schema = True
+                    continue
+                merged_content.append(item)
+            if not inserted_schema:
+                merged_content.insert(0, {"type": "text", "text": schema_prompt})
+            updated[-1]["content"] = merged_content
+            return updated
+        updated[-1]["content"] = schema_prompt
         return updated
     updated.append({"role": "user", "content": schema_prompt})
     return updated
 
 
 def _build_repair_messages(
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     response_text: str,
     schema: dict[str, Any] | str,
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     repair_messages = [dict(message) for message in messages]
     repair_messages.append(
         {

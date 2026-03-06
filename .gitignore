@@ -16,3 +16,4 @@ data/episodic/
 data/obsidian/
 Ideas
 .env
+node_modules/
