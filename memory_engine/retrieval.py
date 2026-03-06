@@ -423,6 +423,7 @@ def build_context_snapshot(
     finally:
         conn.close()
     recent_messages = get_recent_messages(config.MAX_RECENT_MESSAGES)
+    working_memory_refs = working_memory.list_refs(limit=config.WORKING_MEMORY_SNAPSHOT_REF_LIMIT)
     return ContextSnapshot(
         state_version=current_version,
         event_version=event_version,
@@ -434,5 +435,6 @@ def build_context_snapshot(
         vector_results=vector_results,
         delta_facts=delta_facts,
         recent_messages=recent_messages,
+        working_memory_refs=working_memory_refs,
         pinned_facts=pinned_facts,
     )

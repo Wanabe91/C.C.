@@ -47,6 +47,15 @@ def _default_obsidian_vault(memory_cfg: dict) -> str:
     return str(Path(sqlite_path).resolve().parent / "obsidian")
 
 
+def _default_working_memory_path(memory_cfg: dict) -> str:
+    explicit = str(memory_cfg.get("working_memory_path") or "").strip()
+    if explicit:
+        return explicit
+
+    sqlite_path = _default_sqlite_path(memory_cfg)
+    return str(Path(sqlite_path).resolve().parent / "working_memory")
+
+
 def _positive_int(value: object, default: int) -> int:
     if isinstance(value, bool):
         return default
@@ -66,6 +75,7 @@ def _build_memory_engine_config(app_cfg: dict) -> Config:
         SQLITE_PATH=sqlite_path,
         CHROMA_PATH=Path(_default_chroma_path(memory_cfg)).expanduser().resolve(),
         OBSIDIAN_VAULT_PATH=Path(_default_obsidian_vault(memory_cfg)).expanduser().resolve(),
+        WORKING_MEMORY_PATH=Path(_default_working_memory_path(memory_cfg)).expanduser().resolve(),
         ASSISTANT_SYSTEM_PROMPT=str(llm_cfg.get("system_prompt") or ""),
         EMBED_MODEL=str(
             memory_cfg.get("embed_model")
@@ -76,6 +86,23 @@ def _build_memory_engine_config(app_cfg: dict) -> Config:
         INDEXER_POLL_INTERVAL_SEC=_positive_int(memory_cfg.get("indexer_poll_interval_sec"), 2),
         MAX_CONTEXT_FACTS=_positive_int(memory_cfg.get("max_context_facts"), 20),
         MAX_RECENT_MESSAGES=_positive_int(planner_cfg.get("max_recent_messages"), 10),
+        WORKING_MEMORY_OFFLOAD_CHAR_THRESHOLD=_positive_int(
+            memory_cfg.get("working_memory_offload_char_threshold"),
+            8000,
+        ),
+        WORKING_MEMORY_READ_CHAR_LIMIT=_positive_int(
+            memory_cfg.get("working_memory_read_char_limit"),
+            4000,
+        ),
+        WORKING_MEMORY_SEARCH_LIMIT=_positive_int(
+            memory_cfg.get("working_memory_search_limit"),
+            5,
+        ),
+        WORKING_MEMORY_SNAPSHOT_REF_LIMIT=_positive_int(
+            memory_cfg.get("working_memory_snapshot_ref_limit"),
+            10,
+        ),
+        max_steps_per_event=_positive_int(planner_cfg.get("max_steps_per_event"), 10),
     )
 
 

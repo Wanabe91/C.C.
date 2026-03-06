@@ -70,6 +70,7 @@ class LLMRequest:
     tool_registry_block: str
     user_model: str = ""
     preferences: str = ""
+    observation_history: tuple[dict[str, Any], ...] = ()
     image_data_urls: tuple[str, ...] = ()
     identity: IdentityCore = field(default_factory=lambda: CORE)
 
@@ -91,6 +92,20 @@ class LLMRequest:
         context_snapshot = self.context_snapshot.strip()
         if context_snapshot:
             messages.append({"role": "system", "content": f"Context snapshot:\n{context_snapshot}"})
+        if self.observation_history:
+            lines = ["## Steps already executed this turn:"]
+            for i, obs in enumerate(self.observation_history, 1):
+                tool = obs.get("tool", "unknown")
+                args = obs.get("args_summary", "")
+                args_part = f"({args})" if args else ""
+                summary = obs.get("result_summary", "")
+                lines.append(f"{i}. [{tool}]{args_part} -> {summary}")
+            messages.append(
+                {
+                    "role": "system",
+                    "content": "\n".join(lines),
+                }
+            )
         goal = self.goal.strip()
         image_data_urls = tuple(url.strip() for url in self.image_data_urls if isinstance(url, str) and url.strip())
         if image_data_urls:

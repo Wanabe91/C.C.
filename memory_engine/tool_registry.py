@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import functools
+import json
 from dataclasses import dataclass
 from datetime import date
 from typing import Any, Callable
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
+from .config import get_config
 from .identity import CORE
 from .weekly_review import generate_weekly_review
+from .working_memory import working_memory
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,10 +102,45 @@ class NoopArgs(ToolArgsModel):
     pass
 
 
+class GrepMemoryArgs(ToolArgsModel):
+    query: str
+    ref_id: str | None = None
+    limit: int | None = None
+
+    @model_validator(mode="after")
+    def _validate_args(self) -> "GrepMemoryArgs":
+        self.query = self.query.strip()
+        if not self.query:
+            raise ValueError("query must not be empty.")
+        if self.ref_id is not None:
+            self.ref_id = self.ref_id.strip() or None
+        if self.limit is not None and self.limit < 1:
+            raise ValueError("limit must be a positive integer.")
+        return self
+
+
+class ReadMemoryArgs(ToolArgsModel):
+    ref_id: str
+    offset: int = 0
+    limit: int | None = None
+
+    @model_validator(mode="after")
+    def _validate_args(self) -> "ReadMemoryArgs":
+        self.ref_id = self.ref_id.strip()
+        if not self.ref_id:
+            raise ValueError("ref_id must not be empty.")
+        if self.offset < 0:
+            raise ValueError("offset must be greater than or equal to zero.")
+        if self.limit is not None and self.limit < 1:
+            raise ValueError("limit must be a positive integer.")
+        return self
+
+
 def _base_result(tool_name: str) -> dict[str, Any]:
     return {
         "status": "ok",
         "assistant_message": None,
+        "tool_output": None,
         "facts": [],
         "created_tasks": [],
         "completed_task_ids": [],
@@ -173,6 +211,54 @@ def _handle_noop(_: NoopArgs) -> dict[str, Any]:
     return _base_result("noop")
 
 
+def _handle_grep_memory(args: GrepMemoryArgs) -> dict[str, Any]:
+    result = _base_result("grep_memory")
+    grep_result = working_memory.grep(args.query, ref_id=args.ref_id, limit=args.limit)
+    matches = grep_result["matches"]
+    if not matches:
+        result["assistant_message"] = f"No working memory matches found for query: {args.query}"
+        result["meta"] = {
+            **result["meta"],
+            "query": args.query,
+            "searched_refs": grep_result["searched_refs"],
+            "matches": [],
+        }
+        return result
+
+    lines = [f"Working memory matches for query: {args.query}"]
+    for match in matches:
+        source_tool = f" tool={match['source_tool']}" if match.get("source_tool") else ""
+        lines.append(
+            f"- ref={match['ref_id']}{source_tool} field={match['field_name']} "
+            f"offset={match['match_offset']} chars={match['char_count']} snippet={json.dumps(match['snippet'], ensure_ascii=False)}"
+        )
+    result["assistant_message"] = "\n".join(lines)
+    result["meta"] = {
+        **result["meta"],
+        "query": args.query,
+        "searched_refs": grep_result["searched_refs"],
+        "matches": matches,
+    }
+    return result
+
+
+def _handle_read_memory(args: ReadMemoryArgs) -> dict[str, Any]:
+    result = _base_result("read_memory")
+    read_result = working_memory.read(args.ref_id, offset=args.offset, limit=args.limit)
+    header = (
+        f"Working memory read ref={read_result['ref_id']} field={read_result['field_name']} "
+        f"offset={read_result['offset']} next_offset={read_result['next_offset']} "
+        f"total_chars={read_result['total_chars']} has_more={str(read_result['has_more']).lower()}"
+    )
+    content = read_result["content"]
+    result["assistant_message"] = f"{header}\n\n{content}" if content else header
+    result["meta"] = {
+        **result["meta"],
+        **{key: value for key, value in read_result.items() if key != "content"},
+    }
+    return result
+
+
 TOOL_REGISTRY: dict[str, ToolDefinition] = {
     "respond": ToolDefinition(
         name="respond",
@@ -217,6 +303,25 @@ TOOL_REGISTRY: dict[str, ToolDefinition] = {
             '"week_offset": integer?, "title": "optional title"?, "focus": "optional focus"?}'
         ),
     ),
+    "grep_memory": ToolDefinition(
+        name="grep_memory",
+        args_schema=GrepMemoryArgs,
+        handler=_handle_grep_memory,
+        planner_hint=(
+            'Search offloaded working-memory outputs from earlier tool runs. Use when the context snapshot '
+            'mentions working_memory_refs or a prior step stored a large result. '
+            'Args: {"query": "needle", "ref_id": "optional specific ref", "limit": 1-20?}'
+        ),
+    ),
+    "read_memory": ToolDefinition(
+        name="read_memory",
+        args_schema=ReadMemoryArgs,
+        handler=_handle_read_memory,
+        planner_hint=(
+            "Read a specific working-memory chunk after grep_memory identified a ref. "
+            'Args: {"ref_id": "wm_0001", "offset": 0?, "limit": positive integer?}'
+        ),
+    ),
     "noop": ToolDefinition(
         name="noop",
         args_schema=NoopArgs,
@@ -232,10 +337,13 @@ def get_tool(name: str) -> ToolDefinition | None:
 
 @functools.lru_cache(maxsize=None)
 def registry_prompt_block() -> str:
+    config = get_config()
     lines = [
         "Tool selection rules:",
         "- Highest priority: if the user explicitly asks you to remember, save, store, or not forget durable information, use remember_fact before respond.",
         "- Never answer such explicit memory-save requests with only respond.",
+        "- If the context snapshot contains working_memory_refs, those are offloaded large tool outputs. Use grep_memory before read_memory when you need to inspect them.",
+        f"- Keep read_memory chunks at or below about {config.WORKING_MEMORY_READ_CHAR_LIMIT} characters unless you have a clear reason to page further.",
         "Available tools:",
     ]
     for tool_definition in TOOL_REGISTRY.values():

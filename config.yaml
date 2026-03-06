@@ -54,4 +54,4 @@ memory:
   embed_model: "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 
 planner:
-  max_steps: 10
+  max_steps_per_event: 10

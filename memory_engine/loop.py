@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -29,7 +30,7 @@ from .db import (
     list_pending_consolidation_proposals,
     persist_result,
 )
-from .executor import execute_step
+from .executor import execute_step, revalidate
 from .interrupt import InterruptChannel
 from .llm import llm_call
 from .models import ContextSnapshot, FingerprintDiff, ValidatedPlanStep
@@ -171,6 +172,69 @@ def extract_facts_from_result(result: dict[str, Any]) -> list[dict[str, Any]]:
                     }
                 )
     return facts
+
+
+def _should_offload_tool_result(step: ValidatedPlanStep) -> bool:
+    return step.tool not in {"respond", "grep_memory", "read_memory"}
+
+
+def _result_payload_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    text = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
+    return text.strip() or None
+
+
+def _maybe_offload_tool_result(
+    step: ValidatedPlanStep,
+    result: dict[str, Any],
+    *,
+    event_id: int,
+    step_index: int,
+) -> dict[str, Any]:
+    if not _should_offload_tool_result(step):
+        return result
+
+    config = get_config()
+    threshold = config.WORKING_MEMORY_OFFLOAD_CHAR_THRESHOLD
+    prepared = dict(result)
+    meta = dict(prepared.get("meta") or {})
+    raw_refs = meta.get("working_memory_refs")
+    offloaded_refs = [dict(item) for item in raw_refs if isinstance(item, dict)] if isinstance(raw_refs, list) else []
+
+    for field_name in ("assistant_message", "tool_output"):
+        text = _result_payload_text(prepared.get(field_name))
+        if text is None or len(text) <= threshold:
+            continue
+        snapshot = working_memory.offload(
+            prepared[field_name],
+            source_tool=step.tool,
+            event_id=event_id,
+            step_index=step_index,
+            field_name=field_name,
+        )
+        logger.info(
+            "tool_result_offloaded event_id=%s step_index=%s tool=%s field=%s ref_id=%s chars=%s",
+            event_id,
+            step_index,
+            step.tool,
+            field_name,
+            snapshot.get("ref_id"),
+            snapshot.get("char_count"),
+        )
+        offloaded_refs.append(snapshot)
+        prepared[field_name] = working_memory.placeholder_for(snapshot)
+
+    if offloaded_refs:
+        meta["working_memory_refs"] = offloaded_refs
+        first_ref_id = str(offloaded_refs[0].get("ref_id") or "").strip()
+        if first_ref_id:
+            meta["wm_ref"] = f"wm://{first_ref_id}"
+        prepared["meta"] = meta
+    return prepared
 
 
 def _maybe_compact_messages() -> None:
@@ -573,6 +637,154 @@ def _safe_fallback_step() -> ValidatedPlanStep:
     )
 
 
+def _result_summary(result: dict[str, Any]) -> str:
+    assistant_message = str(result.get("assistant_message") or "").strip()
+    if assistant_message:
+        return assistant_message[:200]
+    facts = result.get("facts")
+    if isinstance(facts, list) and facts:
+        return f"stored {len(facts)} fact(s)"
+    if result.get("created_tasks"):
+        return "task created"
+    if result.get("completed_task_ids"):
+        return "task completed"
+    meta = result.get("meta")
+    if isinstance(meta, dict):
+        wm_ref = str(meta.get("wm_ref") or "").strip()
+        if wm_ref:
+            return wm_ref
+        working_memory_refs = meta.get("working_memory_refs")
+        if isinstance(working_memory_refs, list):
+            for item in working_memory_refs:
+                if not isinstance(item, dict):
+                    continue
+                ref_id = str(item.get("ref_id") or "").strip()
+                if ref_id:
+                    return f"wm://{ref_id}"
+    return str(result.get("tool") or result.get("action") or "done")
+
+
+def _normalize_observation_text(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    normalized = re.sub(r"\boffset[=:\s]+\d+", "offset=?", normalized)
+    normalized = re.sub(r"\bnext_offset[=:\s]+\d+", "", normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized
+
+
+def _loop_detected(observations: list[dict[str, Any]], window: int = 3) -> bool:
+    if len(observations) < window:
+        return False
+    tail = observations[-window:]
+    signatures = [
+        (
+            str(obs.get("tool") or "").strip(),
+            _normalize_observation_text(str(obs.get("args_summary") or "")),
+            _normalize_observation_text(str(obs.get("result_summary") or "")),
+        )
+        for obs in tail
+    ]
+    return len(set(signatures)) == 1
+
+
+def _revalidation_failure_result(step: ValidatedPlanStep, details: str | None) -> dict[str, Any]:
+    return {
+        "status": "error",
+        "assistant_message": None,
+        "tool_output": None,
+        "facts": [],
+        "created_tasks": [],
+        "completed_task_ids": [],
+        "generated_reviews": [],
+        "meta": {
+            "action": step.action,
+            "tool": step.tool,
+            "error": "revalidation_failed",
+            "details": str(details or "unknown").strip() or "unknown",
+        },
+    }
+
+
+async def _execute_and_persist(
+    *,
+    step: ValidatedPlanStep,
+    event_id: int,
+    planner_run_id: int,
+    snapshot: ContextSnapshot,
+    step_index: int,
+    fact_version: int,
+    decision_fact_ids: list[int],
+    generated_reviews: list[dict[str, Any]],
+) -> dict[str, Any]:
+    current_version = get_version()
+    is_valid, rejection_reason = revalidate(step, current_version, snapshot.state_version)
+    if not is_valid:
+        result = _revalidation_failure_result(step, rejection_reason)
+        with db_transaction() as conn:
+            insert_step_trace(
+                conn,
+                planner_run_id=planner_run_id,
+                step_index=step_index,
+                action=step.action,
+                tool=step.tool,
+                args=step.args_dict(),
+                precondition_fact_ids=step.precondition_fact_ids,
+                reasoning=step.reasoning,
+                snapshot_state_version=snapshot.state_version,
+                current_state_version=current_version,
+                revalidation_status="revalidation_failed",
+                rejection_reason=rejection_reason,
+                replan_reason=None,
+                replan_count=None,
+                replan_diff_summary=None,
+                execution_status="skipped",
+                result=result,
+            )
+        return result
+
+    result = await execute_step(step)
+    result = _maybe_offload_tool_result(
+        step,
+        result,
+        event_id=event_id,
+        step_index=step_index,
+    )
+    with db_transaction() as conn:
+        persist_result(conn, result, event_id)
+        created_fact_ids: list[int] = []
+        for fact in extract_facts_from_result(result):
+            fact["source_event_id"] = event_id
+            fact_id = insert_fact(conn, fact, fact_version)
+            insert_outbox(conn, fact_id)
+            created_fact_ids.append(fact_id)
+        logged_result = dict(result)
+        if created_fact_ids:
+            logged_result["persisted_fact_ids"] = created_fact_ids
+        insert_step_trace(
+            conn,
+            planner_run_id=planner_run_id,
+            step_index=step_index,
+            action=step.action,
+            tool=step.tool,
+            args=step.args_dict(),
+            precondition_fact_ids=step.precondition_fact_ids,
+            reasoning=step.reasoning,
+            snapshot_state_version=snapshot.state_version,
+            current_state_version=current_version,
+            revalidation_status="executed",
+            rejection_reason=None,
+            replan_reason=None,
+            replan_count=None,
+            replan_diff_summary=None,
+            execution_status=str(result.get("status") or "").strip() or "ok",
+            result=logged_result,
+        )
+        bump_version(conn)
+    decision_fact_ids.extend(created_fact_ids)
+    generated_reviews.extend(result.get("generated_reviews", []))
+    return result
+
+
 async def ingest_event(
     raw: dict[str, Any],
     interrupt: InterruptChannel,
@@ -582,7 +794,6 @@ async def ingest_event(
     assistant_messages: list[str] = []
     decision_fact_ids: list[int] = []
     generated_reviews: list[dict[str, Any]] = []
-    max_replans_per_event = max(1, int(config.max_replans_per_event or MAX_REPLANS_PER_EVENT))
     with db_transaction() as conn:
         event_id = insert_event(conn, raw)
         if raw_text:
@@ -600,204 +811,92 @@ async def ingest_event(
         apply_proposals=proposal_application_enabled,
     )
     goal = extract_goal(raw)
-    plan_run = planner.plan(snapshot, goal)
-    planner_run_id = _persist_planner_run(event_id, plan_run)
-    steps = plan_run.steps
-    replan_count = 0
-    drift_checks_frozen = False
-    last_diff_summary: dict[str, Any] | None = None
-    last_fingerprint_diff_signature: str | None = None
+    observations: list[dict[str, Any]] = []
+    max_steps = max(1, int(config.max_steps_per_event or 10))
+    planner_run_count = 0
+    repair_count = 0
+    steps_executed = 0
+    stop_reason = "unknown"
 
     try:
-        step_index = 0
-        while step_index < len(steps):
+        for iteration in range(max_steps):
             if await interrupt.check():
+                stop_reason = "interrupt"
                 return assistant_messages
-            step = steps[step_index]
-            cur_V = get_version()
-            if not drift_checks_frozen:
-                precondition_changes = _precondition_changed_fact_ids(step, snapshot)
-                if precondition_changes:
-                    replan_reason = "precondition_changed"
-                    diff_summary = _precondition_diff_summary(precondition_changes)
-                    last_diff_summary = diff_summary
-                    replan_count, _r = _handle_replan(
-                        event_id=event_id,
-                        raw_text=raw_text,
-                        goal=goal,
-                        replan_count=replan_count,
-                        max_replans_per_event=max_replans_per_event,
-                        snapshot=snapshot,
-                        step=step,
-                        step_index=step_index,
-                        planner_run_id=planner_run_id,
-                        cur_V=cur_V,
-                        replan_reason=replan_reason,
-                        diff_summary=diff_summary,
-                        proposal_application_enabled=proposal_application_enabled,
-                    )
-                    if _r.new_steps is not None:
-                        steps = _r.new_steps
-                        step_index = 0
-                    if _r.new_snapshot is not None:
-                        snapshot = _r.new_snapshot
-                    if _r.new_planner_run_id is not None:
-                        planner_run_id = _r.new_planner_run_id
-                    drift_checks_frozen = _r.drift_checks_frozen
-                    last_fingerprint_diff_signature = _r.last_fingerprint_diff_signature
-                    continue
+            if _loop_detected(observations):
+                assistant_messages.append("Обнаружен цикл — прерываю.")
+                stop_reason = "loop_detected"
+                break
+            plan_run = planner.plan(snapshot, goal, observations=tuple(observations))
+            planner_run_id = _persist_planner_run(event_id, plan_run)
+            planner_run_count += 1
+            if plan_run.planner_status == "repaired":
+                repair_count += 1
+            if not plan_run.steps:
+                stop_reason = "empty_plan"
+                break
 
-                if config.drift_policy == "threshold":
-                    drift = cur_V - snapshot.state_version
-                    if drift > config.VERSION_DRIFT_THRESHOLD:
-                        replan_reason = "threshold_exceeded"
-                        diff_summary = {
-                            "changed_fact_ids": [],
-                            "removed_fact_ids": [],
-                            "task_changes": False,
-                            "message_changes": False,
-                            "drift": drift,
-                            "threshold": config.VERSION_DRIFT_THRESHOLD,
-                        }
-                        last_diff_summary = diff_summary
-                        replan_count, _r = _handle_replan(
-                            event_id=event_id,
-                            raw_text=raw_text,
-                            goal=goal,
-                            replan_count=replan_count,
-                            max_replans_per_event=max_replans_per_event,
-                            snapshot=snapshot,
-                            step=step,
-                            step_index=step_index,
-                            planner_run_id=planner_run_id,
-                            cur_V=cur_V,
-                            replan_reason=replan_reason,
-                            diff_summary=diff_summary,
-                            proposal_application_enabled=proposal_application_enabled,
-                        )
-                        if _r.new_steps is not None:
-                            steps = _r.new_steps
-                            step_index = 0
-                        if _r.new_snapshot is not None:
-                            snapshot = _r.new_snapshot
-                        if _r.new_planner_run_id is not None:
-                            planner_run_id = _r.new_planner_run_id
-                        drift_checks_frozen = _r.drift_checks_frozen
-                        last_fingerprint_diff_signature = _r.last_fingerprint_diff_signature
-                        continue
-                else:
-                    current_event_version = get_event_version()
-                    if current_event_version != snapshot.event_version:
-                        current_fingerprint = refresh_context_fingerprint(snapshot.fingerprint)
-                        diff = fingerprint_diff(snapshot.fingerprint, current_fingerprint)
-                        if not diff.is_empty:
-                            replan_reason = "context_fingerprint_changed"
-                            diff_summary = _fingerprint_diff_summary(diff)
-                            diff_signature = _replan_diff_signature(diff_summary)
-                            last_diff_summary = diff_summary
-                            if last_fingerprint_diff_signature == diff_signature:
-                                proposal_application_enabled = False
-                                drift_checks_frozen = True
-                                _trace_replan(
-                                    planner_run_id=planner_run_id,
-                                    step_index=step_index,
-                                    step=step,
-                                    snapshot_state_version=snapshot.state_version,
-                                    current_state_version=cur_V,
-                                    revalidation_status="loop_detected",
-                                    replan_reason="replan_loop_detected",
-                                    replan_count=replan_count,
-                                    replan_diff_summary=diff_summary,
-                                )
-                                logger.warning(
-                                    "replan_loop_detected %s",
-                                    json.dumps(
-                                        {
-                                            "event_id": event_id,
-                                            "replan_count": replan_count,
-                                            "replan_diff_summary": diff_summary,
-                                        },
-                                        ensure_ascii=False,
-                                        sort_keys=True,
-                                    ),
-                                )
-                            else:
-                                replan_count, _r = _handle_replan(
-                                    event_id=event_id,
-                                    raw_text=raw_text,
-                                    goal=goal,
-                                    replan_count=replan_count,
-                                    max_replans_per_event=max_replans_per_event,
-                                    snapshot=snapshot,
-                                    step=step,
-                                    step_index=step_index,
-                                    planner_run_id=planner_run_id,
-                                    cur_V=cur_V,
-                                    replan_reason=replan_reason,
-                                    diff_summary=diff_summary,
-                                    proposal_application_enabled=proposal_application_enabled,
-                                )
-                                if _r.new_steps is not None:
-                                    steps = _r.new_steps
-                                    step_index = 0
-                                if _r.new_snapshot is not None:
-                                    snapshot = _r.new_snapshot
-                                if _r.new_planner_run_id is not None:
-                                    planner_run_id = _r.new_planner_run_id
-                                drift_checks_frozen = _r.drift_checks_frozen
-                                last_fingerprint_diff_signature = (
-                                    diff_signature if not _r.drift_checks_frozen else None
-                                )
-                                continue
-                        else:
-                            snapshot.event_version = current_event_version
-                            snapshot.fingerprint = current_fingerprint
-                            last_fingerprint_diff_signature = None
-            result = await execute_step(step)
-            assistant_message = str(result.get("assistant_message") or "").strip()
-            if assistant_message:
-                assistant_messages.append(assistant_message)
-            with db_transaction() as conn:
-                persist_result(conn, result, event_id)
-                created_fact_ids: list[int] = []
-                for fact in extract_facts_from_result(result):
-                    fact["source_event_id"] = event_id
-                    fact_id = insert_fact(conn, fact, V)
-                    insert_outbox(conn, fact_id)
-                    created_fact_ids.append(fact_id)
-                logged_result = dict(result)
-                if created_fact_ids:
-                    logged_result["persisted_fact_ids"] = created_fact_ids
-                insert_step_trace(
-                    conn,
-                    planner_run_id=planner_run_id,
-                    step_index=step_index,
-                    action=step.action,
-                    tool=step.tool,
-                    args=step.args_dict(),
-                    precondition_fact_ids=step.precondition_fact_ids,
-                    reasoning=step.reasoning,
-                    snapshot_state_version=snapshot.state_version,
-                    current_state_version=cur_V,
-                    revalidation_status="executed",
-                    rejection_reason=None,
-                    replan_reason=None,
-                    replan_count=replan_count,
-                    replan_diff_summary=last_diff_summary,
-                    execution_status=str(result.get("status") or "").strip() or "ok",
-                    result=logged_result,
-                )
-                bump_version(conn)
-            decision_fact_ids.extend(created_fact_ids)
-            generated_reviews.extend(result.get("generated_reviews", []))
-            last_diff_summary = None
-            last_fingerprint_diff_signature = None
+            step = plan_run.steps[0]
+            result = await _execute_and_persist(
+                step=step,
+                event_id=event_id,
+                planner_run_id=planner_run_id,
+                snapshot=snapshot,
+                step_index=iteration,
+                fact_version=V,
+                decision_fact_ids=decision_fact_ids,
+                generated_reviews=generated_reviews,
+            )
+            steps_executed += 1
+
+            if step.tool == "respond":
+                assistant_message = str(result.get("assistant_message") or "").strip()
+                if assistant_message:
+                    assistant_messages.append(assistant_message)
+                stop_reason = "respond"
+                break
+
+            observations.append(
+                {
+                    "tool": step.tool or step.action,
+                    "args_summary": str(step.args_dict())[:100],
+                    "result_summary": _result_summary(result),
+                }
+            )
+
             if await interrupt.check():
+                stop_reason = "interrupt"
                 return assistant_messages
-            step_index += 1
+
+            current_version = get_version()
+            current_event_version = get_event_version()
+            snapshot = _build_snapshot(
+                current_version,
+                current_event_version,
+                raw_text,
+                apply_proposals=proposal_application_enabled,
+            )
+        else:
+            assistant_messages.append("Достиг лимита шагов без завершённого ответа.")
+            stop_reason = "max_steps"
         _maybe_compact_messages()
         return assistant_messages
     finally:
+        logger.info(
+            "event_turn_summary %s",
+            json.dumps(
+                {
+                    "event_id": event_id,
+                    "steps_executed": steps_executed,
+                    "planner_run_count": planner_run_count,
+                    "repair_count": repair_count,
+                    "observation_count": len(observations),
+                    "stop_reason": stop_reason,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+        )
         for fact_id in decision_fact_ids:
             try:
                 write_decision_note(fact_id)

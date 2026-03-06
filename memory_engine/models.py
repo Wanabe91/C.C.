@@ -160,6 +160,7 @@ class ContextSnapshot:
     vector_results: list[Fact]
     delta_facts: list[Fact]
     recent_messages: list[dict[str, Any]]
+    working_memory_refs: list[dict[str, Any]] = field(default_factory=list)
     pinned_facts: list[Fact] = field(default_factory=list)
 
     @property

@@ -13,6 +13,7 @@ class Config:
     SQLITE_PATH: Path
     CHROMA_PATH: Path
     OBSIDIAN_VAULT_PATH: Path
+    WORKING_MEMORY_PATH: Path
     ASSISTANT_SYSTEM_PROMPT: str
     EMBED_MODEL: str
     VERSION_DRIFT_THRESHOLD: int
@@ -22,8 +23,13 @@ class Config:
     MAX_RECENT_MESSAGES: int
     COMPACTION_THRESHOLD: int = 50
     COMPACTION_BATCH_SIZE: int = 30
+    WORKING_MEMORY_OFFLOAD_CHAR_THRESHOLD: int = 8000
+    WORKING_MEMORY_READ_CHAR_LIMIT: int = 4000
+    WORKING_MEMORY_SEARCH_LIMIT: int = 5
+    WORKING_MEMORY_SNAPSHOT_REF_LIMIT: int = 10
     drift_policy: Literal["fingerprint", "threshold"] = "fingerprint"
     max_replans_per_event: int = 3
+    max_steps_per_event: int = 10
 
     def validate(self) -> None:
         if self.CHROMA_PATH == self.SQLITE_PATH:
@@ -34,11 +40,22 @@ class Config:
             raise ValueError("drift_policy must be 'fingerprint' or 'threshold'.")
         if self.max_replans_per_event < 1:
             raise ValueError("max_replans_per_event must be at least 1.")
+        if self.max_steps_per_event < 1:
+            raise ValueError("max_steps_per_event must be at least 1.")
+        if self.WORKING_MEMORY_OFFLOAD_CHAR_THRESHOLD < 1:
+            raise ValueError("WORKING_MEMORY_OFFLOAD_CHAR_THRESHOLD must be at least 1.")
+        if self.WORKING_MEMORY_READ_CHAR_LIMIT < 1:
+            raise ValueError("WORKING_MEMORY_READ_CHAR_LIMIT must be at least 1.")
+        if self.WORKING_MEMORY_SEARCH_LIMIT < 1:
+            raise ValueError("WORKING_MEMORY_SEARCH_LIMIT must be at least 1.")
+        if self.WORKING_MEMORY_SNAPSHOT_REF_LIMIT < 1:
+            raise ValueError("WORKING_MEMORY_SNAPSHOT_REF_LIMIT must be at least 1.")
 
     def ensure_directories(self) -> None:
         self.SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
         self.CHROMA_PATH.mkdir(parents=True, exist_ok=True)
         self.OBSIDIAN_VAULT_PATH.mkdir(parents=True, exist_ok=True)
+        self.WORKING_MEMORY_PATH.mkdir(parents=True, exist_ok=True)
 
 
 _active_config: Config | None = None
@@ -52,6 +69,9 @@ def load_config_from_env() -> Config:
         CHROMA_PATH=Path(os.getenv("CHROMA_PATH", "./chroma_store")).expanduser().resolve(),
         OBSIDIAN_VAULT_PATH=Path(
             os.getenv("OBSIDIAN_VAULT_PATH", str(sqlite_path.parent / "obsidian"))
+        ).expanduser().resolve(),
+        WORKING_MEMORY_PATH=Path(
+            os.getenv("WORKING_MEMORY_PATH", str(sqlite_path.parent / "working_memory"))
         ).expanduser().resolve(),
         ASSISTANT_SYSTEM_PROMPT=os.getenv("ASSISTANT_SYSTEM_PROMPT", "").strip(),
         EMBED_MODEL=os.getenv(
@@ -67,6 +87,13 @@ def load_config_from_env() -> Config:
         MAX_RECENT_MESSAGES=int(os.getenv("MAX_RECENT_MESSAGES", "10")),
         COMPACTION_THRESHOLD=int(os.getenv("COMPACTION_THRESHOLD", "50")),
         COMPACTION_BATCH_SIZE=int(os.getenv("COMPACTION_BATCH_SIZE", "30")),
+        WORKING_MEMORY_OFFLOAD_CHAR_THRESHOLD=int(
+            os.getenv("WORKING_MEMORY_OFFLOAD_CHAR_THRESHOLD", "8000")
+        ),
+        WORKING_MEMORY_READ_CHAR_LIMIT=int(os.getenv("WORKING_MEMORY_READ_CHAR_LIMIT", "4000")),
+        WORKING_MEMORY_SEARCH_LIMIT=int(os.getenv("WORKING_MEMORY_SEARCH_LIMIT", "5")),
+        WORKING_MEMORY_SNAPSHOT_REF_LIMIT=int(os.getenv("WORKING_MEMORY_SNAPSHOT_REF_LIMIT", "10")),
+        max_steps_per_event=int(os.getenv("MAX_STEPS_PER_EVENT", "10")),
     )
     config.validate()
     return config

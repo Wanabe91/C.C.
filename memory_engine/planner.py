@@ -39,6 +39,9 @@ PLANNER_SYSTEM_PROMPT_PREFIX = (
     "You are the planning engine for a persistent local AI assistant.\n"
     "Output only valid JSON.\n"
     "Prefer short, deterministic plans.\n"
+    "You receive a list of already-executed steps under '## Steps already executed'.\n"
+    "Use their results to decide the NEXT single step only.\n"
+    "If the goal is achieved, emit one respond step.\n"
     "If the user only needs a direct answer, emit one respond step.\n"
     "CRITICAL: The message in any respond step MUST be written in the same "
     "language as the user's goal. If the user wrote in Russian — respond in Russian."
@@ -138,6 +141,7 @@ def snapshot_payload(ctx: ContextSnapshot, goal: str) -> dict[str, Any]:
         "delta_facts": [_fact_payload(fact) for fact in ctx.delta_facts],
         "pinned_facts": [_fact_payload(fact) for fact in ctx.pinned_facts],
         "recent_messages": ctx.recent_messages,
+        "working_memory_refs": ctx.working_memory_refs,
     }
 
 
@@ -224,10 +228,25 @@ def _respond_step(message: str) -> ValidatedPlanStep:
     )
 
 
-def _enforce_explicit_memory_rules(goal: str, steps: list[ValidatedPlanStep]) -> list[ValidatedPlanStep]:
+def _observation_has_tool(observations: tuple[dict[str, Any], ...], tool_name: str) -> bool:
+    normalized_tool_name = str(tool_name).strip()
+    return any(str(item.get("tool") or "").strip() == normalized_tool_name for item in observations)
+
+
+def _enforce_explicit_memory_rules(
+    goal: str,
+    steps: list[ValidatedPlanStep],
+    observations: tuple[dict[str, Any], ...] = (),
+) -> list[ValidatedPlanStep]:
     fact = _extract_explicit_memory_fact(goal)
     if fact is None:
         return steps
+
+    if _observation_has_tool(observations, "remember_fact"):
+        normalized_steps = [step for step in steps if step.tool != "remember_fact"]
+        if any(step.tool == "respond" for step in normalized_steps):
+            return normalized_steps
+        return [*normalized_steps, _respond_step(_acknowledgement_message(goal))]
 
     remember_steps = [step for step in steps if step.tool == "remember_fact"]
     respond_indices = [index for index, step in enumerate(steps) if step.tool == "respond"]
@@ -302,6 +321,7 @@ def _planner_context_snapshot(ctx: ContextSnapshot, goal: str, context_facts: li
         "constraints": ctx.constraints,
         "facts": [_fact_payload(fact) for fact in context_facts],
         "recent_messages": ctx.recent_messages,
+        "working_memory_refs": ctx.working_memory_refs,
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -427,7 +447,11 @@ def _repair_prompt(raw_response: str, error_message: str) -> str:
     )
 
 
-def plan(ctx: ContextSnapshot, goal: str) -> PlannerRun:
+def plan(
+    ctx: ContextSnapshot,
+    goal: str,
+    observations: tuple[dict[str, Any], ...] = (),
+) -> PlannerRun:
     prompt = _planner_user_prompt(goal)
     system_prompt = _planner_system_prompt()
     snapshot = snapshot_payload(ctx, goal)
@@ -439,10 +463,11 @@ def plan(ctx: ContextSnapshot, goal: str) -> PlannerRun:
         tool_registry_block=f"{system_prompt}\n{registry_prompt_block()}".strip(),
         user_model=_facts_to_block(user_model_facts),
         preferences=_facts_to_block(preference_facts),
+        observation_history=observations,
     )
     first_response = llm_call(request, schema=PLANNER_JSON_SCHEMA)
     try:
-        steps = _enforce_explicit_memory_rules(goal, _parse_steps(first_response))
+        steps = _enforce_explicit_memory_rules(goal, _parse_steps(first_response), observations)
         return PlannerRun(
             goal=goal,
             snapshot=snapshot,
@@ -460,6 +485,7 @@ def plan(ctx: ContextSnapshot, goal: str) -> PlannerRun:
             tool_registry_block=request.tool_registry_block,
             user_model=request.user_model,
             preferences=request.preferences,
+            observation_history=observations,
             identity=request.identity,
         )
         second_response = llm_call(
@@ -467,7 +493,7 @@ def plan(ctx: ContextSnapshot, goal: str) -> PlannerRun:
             schema=PLANNER_JSON_SCHEMA,
         )
         try:
-            steps = _enforce_explicit_memory_rules(goal, _parse_steps(second_response))
+            steps = _enforce_explicit_memory_rules(goal, _parse_steps(second_response), observations)
             return PlannerRun(
                 goal=goal,
                 snapshot=snapshot,
