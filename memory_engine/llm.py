@@ -55,6 +55,13 @@ PROVIDER_DEFAULT_MODELS: dict[str, str] = {
     "openai_o3": TASK_MODEL_MAP[TaskType.MATH],
 }
 
+LANGUAGE_LOCK_SYSTEM_PROMPT = (
+    "CRITICAL: Always respond in the same language the user wrote in.\n"
+    "If the user writes in English, respond in English.\n"
+    "If the user writes in Russian, respond in Russian.\n"
+    "Never switch languages unless the user explicitly asks you to."
+)
+
 
 @dataclass(slots=True)
 class LLMRequest:
@@ -71,6 +78,7 @@ class LLMRequest:
         identity_block = self.identity.as_system_block().strip()
         if identity_block:
             messages.append({"role": "system", "content": identity_block})
+        messages.append({"role": "system", "content": LANGUAGE_LOCK_SYSTEM_PROMPT})
         tool_registry_block = self.tool_registry_block.strip()
         if tool_registry_block:
             messages.append({"role": "system", "content": tool_registry_block})

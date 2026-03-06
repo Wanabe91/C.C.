@@ -178,14 +178,21 @@ TOOL_REGISTRY: dict[str, ToolDefinition] = {
         name="respond",
         args_schema=RespondArgs,
         handler=_handle_respond,
-        planner_hint='Use when the user only needs a direct answer. Args: {"message": "assistant reply"}',
+        planner_hint=(
+            'Use when the user only needs a direct answer and is not asking to save memory. '
+            'Do not use this alone for explicit remember/save/store requests. '
+            'Args: {"message": "assistant reply"}'
+        ),
     ),
     "remember_fact": ToolDefinition(
         name="remember_fact",
         args_schema=RememberFactArgs,
         handler=_handle_remember_fact,
         planner_hint=(
-            'Store durable knowledge. Args: {"content": "fact to store", '
+            'Highest priority for explicit memory-save requests. Use when the user asks you '
+            'to remember, save, store, or not forget durable information. '
+            'If the user also wants a reply, use remember_fact before respond. '
+            'Args: {"content": "fact to store", '
             '"importance": "core|contextual|transient"?, "tier": "active|cold|archived"?, "meta": {...}?}'
         ),
     ),
@@ -225,7 +232,12 @@ def get_tool(name: str) -> ToolDefinition | None:
 
 @functools.lru_cache(maxsize=None)
 def registry_prompt_block() -> str:
-    lines = ["Available tools:"]
+    lines = [
+        "Tool selection rules:",
+        "- Highest priority: if the user explicitly asks you to remember, save, store, or not forget durable information, use remember_fact before respond.",
+        "- Never answer such explicit memory-save requests with only respond.",
+        "Available tools:",
+    ]
     for tool_definition in TOOL_REGISTRY.values():
         lines.append(f"- {tool_definition.name}: {tool_definition.planner_hint}")
     return "\n".join(lines)

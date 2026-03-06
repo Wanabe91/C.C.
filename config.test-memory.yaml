@@ -1,0 +1,41 @@
+llm:
+  default_task: "fast"
+  system_prompt: "Ты персональный ИИ-ассистент. Отвечай всегда на том языке, на котором написал пользователь. Ответы сдержанны и логичны. Когда говоришь о запомненных фактах, говори от первого лица, живым языком, а не как отчёт."
+  temperature: 0.3
+  max_tokens: 2048
+  providers:
+    groq:
+      model: "groq/llama-3.3-70b-versatile"
+      enabled: true
+    claude:
+      model: "claude-sonnet-4-6"
+      enabled: true
+    openai_gpt4o:
+      model: "gpt-4o"
+      enabled: true
+    openai_o3:
+      model: "o3-mini"
+      enabled: false
+
+tts:
+  enabled: false
+
+vision:
+  enabled: false
+
+memory:
+  short_term_limit: 20
+  episodic_enabled: true
+  episodic_db: "data/test-run/episodic"
+  obsidian_vault: "data/test-run/obsidian"
+  profile_path: "data/test-run/profile.json"
+  embed_model: "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+  chroma_path: "data/test-run/chroma_store"
+  sqlite_path: "data/test-run/agent_memory.db"
+  consolidation_interval_sec: 60
+  indexer_poll_interval_sec: 2
+  max_context_facts: 20
+
+planner:
+  max_steps: 10
+  max_recent_messages: 10

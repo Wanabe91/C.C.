@@ -45,6 +45,20 @@ PLANNER_SYSTEM_PROMPT_PREFIX = (
 )
 
 
+PLANNER_MEMORY_RULES = (
+    "Memory-save rule:\n"
+    "When the user explicitly asks to save, remember, store, or not forget information, "
+    "you MUST include a remember_fact step before any respond step.\n"
+    "This applies to requests such as 'remember that', 'remember...', 'store this', "
+    "'save this', 'don't forget', 'запомни', 'запомни, что', 'сохрани', 'не забудь', "
+    "'я хочу, чтобы ты знал', and also clear durable user facts phrased like 'my X is Y' "
+    "or 'у меня X = Y' when the user is clearly presenting a persistent fact to retain.\n"
+    "Never emit only respond when the user is explicitly asking to save information.\n"
+    "If the user asks to save information and also wants an acknowledgement, the plan "
+    "must be remember_fact first and respond second."
+)
+
+
 class PlannerValidationError(ValueError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
@@ -73,9 +87,10 @@ def _planner_validation_code(message: str) -> str:
 def _planner_system_prompt() -> str:
     assistant_prompt = get_config().ASSISTANT_SYSTEM_PROMPT
     if not assistant_prompt:
-        return PLANNER_SYSTEM_PROMPT_PREFIX
+        return f"{PLANNER_SYSTEM_PROMPT_PREFIX}\n{PLANNER_MEMORY_RULES}"
     return (
         f"{PLANNER_SYSTEM_PROMPT_PREFIX}\n"
+        f"{PLANNER_MEMORY_RULES}\n"
         "When emitting a respond step, follow this assistant style instruction:\n"
         f"{assistant_prompt}\n"
         "Regardless of the language facts are stored in, always reply in the "
@@ -140,6 +155,102 @@ def _planner_user_prompt(goal: str) -> str:
         "}\n\n"
         f"Goal:\n{goal.strip()}"
     )
+
+
+_EXPLICIT_MEMORY_PREFIXES = (
+    r"remember(?:\s+that)?",
+    r"store(?:\s+this|\s+that)?",
+    r"save(?:\s+this|\s+that)?",
+    r"don't forget(?:\s+that)?",
+    r"запомни(?:,\s*что)?",
+    r"сохрани(?:,\s*что)?",
+    r"не забудь(?:,\s*что)?",
+    r"я хочу,\s*чтобы ты знал(?:,\s*что)?",
+)
+
+_MEMORY_TAIL_MARKERS = (
+    r"(?:[.!?]\s*|\s+)(?:then\s+)?(?:reply|respond|answer|confirm)\b.*$",
+    r"(?:[.!?]\s*|\s+)(?:please\s+)?(?:reply|respond|answer|confirm)\b.*$",
+    r"(?:[.!?]\s*|\s+)(?:ответь|подтверди|скажи)\b.*$",
+)
+
+
+def _extract_explicit_memory_fact(goal: str) -> str | None:
+    text = goal.strip()
+    if not text:
+        return None
+
+    for prefix in _EXPLICIT_MEMORY_PREFIXES:
+        match = re.match(
+            rf"^\s*(?:please\s+)?{prefix}\s*[:,-]?\s*(?P<fact>.+?)\s*$",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if match is None:
+            continue
+        fact = match.group("fact").strip()
+        for tail_pattern in _MEMORY_TAIL_MARKERS:
+            fact = re.sub(tail_pattern, "", fact, flags=re.IGNORECASE).strip()
+        fact = fact.strip().strip("\"'").rstrip(".!?;,")
+        return fact or None
+    return None
+
+
+def _acknowledgement_message(goal: str) -> str:
+    return "Запомнил." if re.search(r"[А-Яа-яЁё]", goal) else "I'll remember that."
+
+
+def _remember_step(fact: str) -> ValidatedPlanStep:
+    return ValidatedPlanStep.model_validate(
+        {
+            "action": "remember explicit user fact",
+            "tool": "remember_fact",
+            "args": {"content": fact},
+            "precondition_fact_ids": [],
+            "reasoning": "The user explicitly asked the assistant to save this information.",
+        }
+    )
+
+
+def _respond_step(message: str) -> ValidatedPlanStep:
+    return ValidatedPlanStep.model_validate(
+        {
+            "action": "acknowledge saved memory",
+            "tool": "respond",
+            "args": {"message": message},
+            "precondition_fact_ids": [],
+            "reasoning": "Acknowledge that the requested memory was saved.",
+        }
+    )
+
+
+def _enforce_explicit_memory_rules(goal: str, steps: list[ValidatedPlanStep]) -> list[ValidatedPlanStep]:
+    fact = _extract_explicit_memory_fact(goal)
+    if fact is None:
+        return steps
+
+    remember_steps = [step for step in steps if step.tool == "remember_fact"]
+    respond_indices = [index for index, step in enumerate(steps) if step.tool == "respond"]
+    first_respond_index = respond_indices[0] if respond_indices else None
+
+    if not remember_steps:
+        normalized_steps = list(steps)
+        insert_at = first_respond_index if first_respond_index is not None else 0
+        normalized_steps.insert(insert_at, _remember_step(fact))
+        if first_respond_index is None:
+            normalized_steps.append(_respond_step(_acknowledgement_message(goal)))
+        return normalized_steps
+
+    if first_respond_index is None:
+        return [*steps, _respond_step(_acknowledgement_message(goal))]
+
+    first_remember_index = next(index for index, step in enumerate(steps) if step.tool == "remember_fact")
+    if first_remember_index <= first_respond_index:
+        return steps
+
+    normalized_steps = [step for index, step in enumerate(steps) if index != first_remember_index]
+    normalized_steps.insert(first_respond_index, steps[first_remember_index])
+    return normalized_steps
 
 
 def _fact_kind(fact: Fact) -> str:
@@ -331,7 +442,7 @@ def plan(ctx: ContextSnapshot, goal: str) -> PlannerRun:
     )
     first_response = llm_call(request, schema=PLANNER_JSON_SCHEMA)
     try:
-        steps = _parse_steps(first_response)
+        steps = _enforce_explicit_memory_rules(goal, _parse_steps(first_response))
         return PlannerRun(
             goal=goal,
             snapshot=snapshot,
@@ -356,7 +467,7 @@ def plan(ctx: ContextSnapshot, goal: str) -> PlannerRun:
             schema=PLANNER_JSON_SCHEMA,
         )
         try:
-            steps = _parse_steps(second_response)
+            steps = _enforce_explicit_memory_rules(goal, _parse_steps(second_response))
             return PlannerRun(
                 goal=goal,
                 snapshot=snapshot,

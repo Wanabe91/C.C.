@@ -75,6 +75,13 @@ class PersonalAI:
         if meta:
             print(f"[TTS] {' '.join(meta)}")
 
+    @staticmethod
+    async def _read_input(prompt: str) -> str | None:
+        try:
+            return (await asyncio.to_thread(input, prompt)).strip()
+        except EOFError:
+            return None
+
     async def close(self):
         if self.vision is not None:
             await self.vision.close()
@@ -82,7 +89,9 @@ class PersonalAI:
 
     async def text_mode(self):
         while True:
-            inp = input("You: ").strip()
+            inp = await self._read_input("You: ")
+            if inp is None:
+                break
             if not inp:
                 continue
             if inp.lower() in ("exit", "\u0432\u044b\u0445\u043e\u0434"):
@@ -96,7 +105,9 @@ class PersonalAI:
         print("Vision mode: type a prompt for the current camera frame and press Enter.")
         print("Press Enter on an empty line to use the default prompt. Type 'exit' to quit.\n")
         while True:
-            inp = input("Vision: ").strip()
+            inp = await self._read_input("Vision: ")
+            if inp is None:
+                break
             if inp.lower() in ("exit", "\u0432\u044b\u0445\u043e\u0434"):
                 break
             try:
@@ -106,7 +117,9 @@ class PersonalAI:
 
     async def vision_stream_mode(self):
         vision = await self._ensure_vision()
-        prompt = input("Stream prompt (blank = default): ").strip()
+        prompt = await self._read_input("Stream prompt (blank = default): ")
+        if prompt is None:
+            return
         print("Vision stream mode: local machine vision runs continuously, GPT-4o samples frames periodically.")
         if vision.stream_show_window:
             print("Close the preview window with 'q' or stop the console process to exit.\n")

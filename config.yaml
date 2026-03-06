@@ -29,7 +29,7 @@ stt:
 tts:
   enabled: false
   engine: "elevenlabs"
-  voice_id: ""
+  voice_id: "sk_b90ce21a57156bab8b99f184000faa0aafc7b3cb4fcd136c"
   model_id: "eleven_multilingual_v2"
   output_format: "wav_22050"
   playback: true
