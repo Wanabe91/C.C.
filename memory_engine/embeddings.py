@@ -21,5 +21,16 @@ def _get_st_model() -> SentenceTransformer:
     return _SentenceTransformer(config.EMBED_MODEL)
 
 
+def clear_embedding_model_cache() -> None:
+    _get_st_model.cache_clear()
+
+
+def embed_many(texts: list[str] | tuple[str, ...]) -> list[list[float]]:
+    if not texts:
+        return []
+    encoded = _get_st_model().encode(list(texts))
+    return encoded.tolist()
+
+
 def embed(text: str) -> list[float]:
-    return _get_st_model().encode(text).tolist()
+    return embed_many([text])[0]

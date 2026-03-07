@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 import sys
 import threading
 from dataclasses import dataclass
@@ -15,6 +16,8 @@ try:
     import cv2
 except ImportError:  # pragma: no cover - dependency availability depends on the local environment.
     cv2 = None
+
+logger = logging.getLogger(__name__)
 
 
 def _coerce_int(value: Any, default: int) -> int:
@@ -239,9 +242,11 @@ class VisionModule:
             cv2.imshow(self.stream_window_name, self._annotate_preview_frame(live_frame))
             key = cv2.waitKey(1) & 0xFF
             return key in {ord("q"), 27}
-        except Exception:
-            self._window_available = False
-            return False
+        except Exception as exc:
+            raise RuntimeError(
+                f"Vision preview failed for window '{self.stream_window_name}'. "
+                "Disable vision.stream_show_window to run without the preview window."
+            ) from exc
 
     def _analyze_frame_sync(self, prompt: str, captured_frame: CapturedFrame) -> VisionResult:
         machine_vision_summary = captured_frame.machine_vision_result.summary.strip()
@@ -286,5 +291,9 @@ class VisionModule:
             try:
                 cv2.destroyWindow(self.stream_window_name)
             except Exception:
-                pass
+                logger.debug(
+                    "Failed to destroy vision preview window '%s'",
+                    self.stream_window_name,
+                    exc_info=True,
+                )
         await asyncio.to_thread(self._release_capture)

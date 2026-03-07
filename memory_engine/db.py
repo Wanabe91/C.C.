@@ -7,6 +7,14 @@ from contextlib import contextmanager
 from typing import Any, Iterator
 
 from .config import get_config
+from .epistemics import (
+    VERIFICATION_METHOD_TO_STATUS,
+    default_confidence_for_status,
+    normalize_confidence_score,
+    normalize_verification_status,
+    stronger_verification_status,
+    weaker_verification_status,
+)
 from .models import Fact, Task
 
 SCHEMA_SQL = """
@@ -31,7 +39,13 @@ CREATE TABLE IF NOT EXISTS facts (
   source_event_id INTEGER REFERENCES events(id), meta_json TEXT,
   created_at REAL,
   last_accessed_at REAL,
-  access_count INTEGER NOT NULL DEFAULT 0
+  access_count INTEGER NOT NULL DEFAULT 0,
+  confidence_score REAL NOT NULL DEFAULT 0.2,
+  verification_status TEXT NOT NULL DEFAULT 'unverified',
+  verification_count INTEGER NOT NULL DEFAULT 0,
+  last_verified_at REAL,
+  evidence_json TEXT NOT NULL DEFAULT '[]',
+  contradiction_group_id TEXT
 );
 CREATE TABLE IF NOT EXISTS tasks (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -225,6 +239,12 @@ def _migrate_runtime_tables(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "facts", "tier", "TEXT NOT NULL DEFAULT 'active'")
     _ensure_column(conn, "facts", "last_accessed_at", "REAL")
     _ensure_column(conn, "facts", "access_count", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "facts", "confidence_score", "REAL NOT NULL DEFAULT 0.2")
+    _ensure_column(conn, "facts", "verification_status", "TEXT NOT NULL DEFAULT 'unverified'")
+    _ensure_column(conn, "facts", "verification_count", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "facts", "last_verified_at", "REAL")
+    _ensure_column(conn, "facts", "evidence_json", "TEXT NOT NULL DEFAULT '[]'")
+    _ensure_column(conn, "facts", "contradiction_group_id", "TEXT")
     _ensure_column(conn, "tasks", "created_at", "REAL")
     _ensure_column(conn, "tasks", "completed_at", "REAL")
     _ensure_column(conn, "weekly_reviews", "note_path", "TEXT")
@@ -252,6 +272,38 @@ def _migrate_runtime_tables(conn: sqlite3.Connection) -> None:
         UPDATE facts
         SET access_count = 0
         WHERE access_count IS NULL OR access_count < 0
+        """
+    )
+    conn.execute(
+        """
+        UPDATE facts
+        SET confidence_score = 0.2
+        WHERE confidence_score IS NULL OR confidence_score < 0 OR confidence_score > 1
+        """
+    )
+    conn.execute(
+        """
+        UPDATE facts
+        SET verification_status = 'unverified'
+        WHERE verification_status IS NULL
+           OR TRIM(verification_status) NOT IN (
+             'unverified', 'self_reported', 'logically_consistent',
+             'user_confirmed', 'externally_confirmed', 'contradicted'
+           )
+        """
+    )
+    conn.execute(
+        """
+        UPDATE facts
+        SET verification_count = 0
+        WHERE verification_count IS NULL OR verification_count < 0
+        """
+    )
+    conn.execute(
+        """
+        UPDATE facts
+        SET evidence_json = '[]'
+        WHERE evidence_json IS NULL OR TRIM(evidence_json) = ''
         """
     )
 
@@ -285,6 +337,15 @@ def _loads_json(value: str | None) -> dict[str, Any] | None:
     return json.loads(value)
 
 
+def _loads_json_list(value: str | None) -> list[dict[str, Any]]:
+    if not value:
+        return []
+    payload = json.loads(value)
+    if not isinstance(payload, list):
+        return []
+    return [item for item in payload if isinstance(item, dict)]
+
+
 def _normalize_fact_importance(value: Any) -> str:
     normalized = str(value or "").strip().lower()
     if normalized in {"core", "contextual", "transient"}:
@@ -307,9 +368,20 @@ def _normalize_access_count(value: Any) -> int:
     return normalized if normalized >= 0 else 0
 
 
+def _normalize_verification_count(value: Any) -> int:
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return normalized if normalized >= 0 else 0
+
+
 def _fact_from_row(row: sqlite3.Row | None) -> Fact | None:
     if row is None:
         return None
+    verification_status = normalize_verification_status(
+        row["verification_status"] if "verification_status" in row.keys() else None
+    )
     return Fact(
         id=int(row["id"]),
         content=row["content"],
@@ -327,6 +399,25 @@ def _fact_from_row(row: sqlite3.Row | None) -> Fact | None:
             else None
         ),
         access_count=_normalize_access_count(row["access_count"] if "access_count" in row.keys() else None),
+        confidence_score=normalize_confidence_score(
+            row["confidence_score"] if "confidence_score" in row.keys() else None,
+            fallback=default_confidence_for_status(verification_status),
+        ),
+        verification_status=verification_status,
+        verification_count=_normalize_verification_count(
+            row["verification_count"] if "verification_count" in row.keys() else None
+        ),
+        last_verified_at=(
+            float(row["last_verified_at"])
+            if "last_verified_at" in row.keys() and row["last_verified_at"] is not None
+            else None
+        ),
+        evidence=_loads_json_list(row["evidence_json"] if "evidence_json" in row.keys() else None),
+        contradiction_group_id=(
+            str(row["contradiction_group_id"]).strip() or None
+            if "contradiction_group_id" in row.keys() and row["contradiction_group_id"] is not None
+            else None
+        ),
         meta=_loads_json(row["meta_json"]),
     )
 
@@ -450,6 +541,19 @@ def insert_fact(conn: sqlite3.Connection, fact: Fact | dict[str, Any] | str, ver
         created_at = fact.created_at if fact.created_at is not None else time.time()
         last_accessed_at = fact.last_accessed_at
         access_count = _normalize_access_count(fact.access_count)
+        verification_status = normalize_verification_status(fact.verification_status)
+        confidence_score = normalize_confidence_score(
+            fact.confidence_score,
+            fallback=default_confidence_for_status(verification_status),
+        )
+        verification_count = _normalize_verification_count(fact.verification_count)
+        last_verified_at = fact.last_verified_at
+        evidence_json = json.dumps(fact.evidence or [], ensure_ascii=False)
+        contradiction_group_id = (
+            str(fact.contradiction_group_id).strip() or None
+            if fact.contradiction_group_id is not None
+            else None
+        )
     elif isinstance(fact, str):
         content = fact.strip()
         source_event_id = None
@@ -459,6 +563,12 @@ def insert_fact(conn: sqlite3.Connection, fact: Fact | dict[str, Any] | str, ver
         created_at = time.time()
         last_accessed_at = None
         access_count = 0
+        verification_status = "unverified"
+        confidence_score = default_confidence_for_status(verification_status)
+        verification_count = 0
+        last_verified_at = None
+        evidence_json = json.dumps([], ensure_ascii=False)
+        contradiction_group_id = None
     else:
         content = str(fact.get("content", "")).strip()
         source_event_id = fact.get("source_event_id")
@@ -472,14 +582,34 @@ def insert_fact(conn: sqlite3.Connection, fact: Fact | dict[str, Any] | str, ver
             else None
         )
         access_count = _normalize_access_count(fact.get("access_count"))
+        verification_status = normalize_verification_status(fact.get("verification_status"))
+        confidence_score = normalize_confidence_score(
+            fact.get("confidence_score"),
+            fallback=default_confidence_for_status(verification_status),
+        )
+        verification_count = _normalize_verification_count(fact.get("verification_count"))
+        last_verified_at = (
+            float(fact["last_verified_at"])
+            if fact.get("last_verified_at") is not None
+            else None
+        )
+        evidence_payload = fact.get("evidence")
+        evidence_json = json.dumps(evidence_payload if isinstance(evidence_payload, list) else [], ensure_ascii=False)
+        contradiction_group_id = (
+            str(fact.get("contradiction_group_id") or "").strip() or None
+        )
     if not content:
         raise ValueError("Fact content must not be empty.")
+    if verification_count > 0 and last_verified_at is None:
+        last_verified_at = created_at
     cur = conn.execute(
         """
         INSERT INTO facts(
             content, embedding_id, version_created, version_superseded,
-            status, importance, tier, source_event_id, meta_json, created_at, last_accessed_at, access_count
-        ) VALUES (?, NULL, ?, NULL, 'active', ?, ?, ?, ?, ?, ?, ?)
+            status, importance, tier, source_event_id, meta_json, created_at, last_accessed_at, access_count,
+            confidence_score, verification_status, verification_count, last_verified_at, evidence_json,
+            contradiction_group_id
+        ) VALUES (?, NULL, ?, NULL, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             content,
@@ -491,6 +621,12 @@ def insert_fact(conn: sqlite3.Connection, fact: Fact | dict[str, Any] | str, ver
             created_at,
             last_accessed_at,
             access_count,
+            confidence_score,
+            verification_status,
+            verification_count,
+            last_verified_at,
+            evidence_json,
+            contradiction_group_id,
         ),
     )
     fact_id = int(cur.lastrowid)
@@ -561,7 +697,9 @@ def get_fact_record_by_id(fact_id: int) -> dict[str, Any] | None:
             """
             SELECT
               id, content, status, importance, tier, source_event_id, meta_json,
-              created_at, last_accessed_at, access_count, version_created, version_superseded
+              created_at, last_accessed_at, access_count, confidence_score, verification_status,
+              verification_count, last_verified_at, evidence_json, contradiction_group_id,
+              version_created, version_superseded
             FROM facts
             WHERE id = ?
             """,
@@ -582,6 +720,21 @@ def get_fact_record_by_id(fact_id: int) -> dict[str, Any] | None:
                 float(row["last_accessed_at"]) if row["last_accessed_at"] is not None else None
             ),
             "access_count": _normalize_access_count(row["access_count"]),
+            "confidence_score": normalize_confidence_score(
+                row["confidence_score"],
+                fallback=default_confidence_for_status(row["verification_status"]),
+            ),
+            "verification_status": normalize_verification_status(row["verification_status"]),
+            "verification_count": _normalize_verification_count(row["verification_count"]),
+            "last_verified_at": (
+                float(row["last_verified_at"]) if row["last_verified_at"] is not None else None
+            ),
+            "evidence": _loads_json_list(row["evidence_json"]),
+            "contradiction_group_id": (
+                str(row["contradiction_group_id"]).strip() or None
+                if row["contradiction_group_id"] is not None
+                else None
+            ),
             "version_created": int(row["version_created"]),
             "version_superseded": row["version_superseded"],
         }
@@ -1053,6 +1206,105 @@ def touch_fact_accesses(
     )
 
 
+def record_fact_verification(
+    fact_id: int,
+    *,
+    method: str,
+    source_ref: str | None = None,
+    note: str | None = None,
+    verified_at: float | None = None,
+    contradiction_group_id: str | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    normalized_fact_id = int(fact_id)
+    if normalized_fact_id <= 0:
+        raise ValueError("fact_id must be a positive integer.")
+    normalized_method = str(method or "").strip().lower()
+    if normalized_method not in VERIFICATION_METHOD_TO_STATUS:
+        raise ValueError(f"Unsupported verification method: {method or 'unknown'}")
+
+    should_close = False
+    local_conn = conn
+    if local_conn is None:
+        local_conn = _connect()
+        local_conn.execute("BEGIN IMMEDIATE")
+        should_close = True
+    try:
+        row = local_conn.execute("SELECT * FROM facts WHERE id = ?", (normalized_fact_id,)).fetchone()
+        fact = _fact_from_row(row)
+        if fact is None:
+            if should_close:
+                local_conn.rollback()
+            return False
+
+        timestamp = float(verified_at) if verified_at is not None else time.time()
+        current_status = normalize_verification_status(fact.verification_status)
+        target_status = VERIFICATION_METHOD_TO_STATUS[normalized_method]
+        if target_status == "contradicted":
+            next_status = "contradicted"
+            next_confidence = min(
+                normalize_confidence_score(fact.confidence_score, fallback=default_confidence_for_status(current_status)),
+                default_confidence_for_status("contradicted"),
+            )
+            next_contradiction_group_id = (
+                str(contradiction_group_id).strip()
+                if contradiction_group_id is not None and str(contradiction_group_id).strip()
+                else fact.contradiction_group_id or f"fact:{normalized_fact_id}"
+            )
+        else:
+            next_status = stronger_verification_status(current_status, target_status)
+            next_confidence = max(
+                normalize_confidence_score(
+                    fact.confidence_score,
+                    fallback=default_confidence_for_status(current_status),
+                ),
+                default_confidence_for_status(target_status),
+            )
+            next_contradiction_group_id = (
+                str(contradiction_group_id).strip()
+                if contradiction_group_id is not None and str(contradiction_group_id).strip()
+                else fact.contradiction_group_id
+            )
+
+        evidence = [dict(item) for item in fact.evidence or [] if isinstance(item, dict)]
+        evidence.append(
+            {
+                "kind": "verification",
+                "method": normalized_method,
+                "status_after": next_status,
+                "source_ref": str(source_ref).strip() if source_ref is not None else None,
+                "note": str(note).strip() if note is not None else None,
+                "recorded_at": timestamp,
+            }
+        )
+        local_conn.execute(
+            """
+            UPDATE facts
+            SET confidence_score = ?, verification_status = ?, verification_count = COALESCE(verification_count, 0) + 1,
+                last_verified_at = ?, evidence_json = ?, contradiction_group_id = ?
+            WHERE id = ?
+            """,
+            (
+                normalize_confidence_score(next_confidence, fallback=default_confidence_for_status(next_status)),
+                next_status,
+                timestamp,
+                json.dumps(evidence, ensure_ascii=False),
+                next_contradiction_group_id,
+                normalized_fact_id,
+            ),
+        )
+        if should_close:
+            local_conn.commit()
+        return True
+    except Exception:
+        if should_close:
+            local_conn.rollback()
+        raise
+    finally:
+        if should_close:
+            local_conn.close()
+
+
 def _legacy_proposal_payload(row: sqlite3.Row) -> dict[str, Any] | None:
     try:
         source_fact_ids = json.loads(row["source_fact_ids"])
@@ -1280,7 +1532,10 @@ def list_facts_created_between(start_ts: float, end_ts: float) -> list[dict[str,
     try:
         rows = conn.execute(
             """
-            SELECT id, content, status, source_event_id, meta_json, created_at
+            SELECT
+              id, content, status, source_event_id, meta_json, created_at,
+              confidence_score, verification_status, verification_count,
+              last_verified_at, contradiction_group_id
             FROM facts
             WHERE created_at IS NOT NULL AND created_at >= ? AND created_at < ?
             ORDER BY created_at ASC, id ASC
@@ -1295,6 +1550,20 @@ def list_facts_created_between(start_ts: float, end_ts: float) -> list[dict[str,
                 "source_event_id": row["source_event_id"],
                 "meta": _loads_json(row["meta_json"]) or {},
                 "created_at": float(row["created_at"]),
+                "confidence_score": normalize_confidence_score(
+                    row["confidence_score"],
+                    fallback=default_confidence_for_status(row["verification_status"]),
+                ),
+                "verification_status": normalize_verification_status(row["verification_status"]),
+                "verification_count": _normalize_verification_count(row["verification_count"]),
+                "last_verified_at": (
+                    float(row["last_verified_at"]) if row["last_verified_at"] is not None else None
+                ),
+                "contradiction_group_id": (
+                    str(row["contradiction_group_id"]).strip() or None
+                    if row["contradiction_group_id"] is not None
+                    else None
+                ),
             }
             for row in rows
         ]

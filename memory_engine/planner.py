@@ -43,6 +43,8 @@ PLANNER_SYSTEM_PROMPT_PREFIX = (
     "Use their results to decide the NEXT single step only.\n"
     "If the goal is achieved, emit one respond step.\n"
     "If the user only needs a direct answer, emit one respond step.\n"
+    "Treat salience and truth separately: access_count and last_accessed_at show reuse, not certainty.\n"
+    "Use verification_status and confidence_score when deciding whether a memory is tentative or confirmed.\n"
     "CRITICAL: The message in any respond step MUST be written in the same "
     "language as the user's goal. If the user wrote in Russian — respond in Russian."
 )
@@ -125,6 +127,12 @@ def _fact_payload(fact: Fact) -> dict[str, Any]:
         "created_at": fact.created_at,
         "last_accessed_at": fact.last_accessed_at,
         "access_count": fact.access_count,
+        "confidence_score": fact.confidence_score,
+        "verification_status": fact.verification_status,
+        "verification_count": fact.verification_count,
+        "last_verified_at": fact.last_verified_at,
+        "evidence": fact.evidence,
+        "contradiction_group_id": fact.contradiction_group_id,
         "meta": fact.meta,
     }
 

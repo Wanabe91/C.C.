@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -104,6 +105,7 @@ def set_active_config(cfg: Config) -> None:
 
     cfg.validate()  # Keep env-loaded and YAML-built configs under the same validation rules.
     _active_config = cfg
+    _invalidate_runtime_caches()
 
 
 def get_config() -> Config:
@@ -113,3 +115,23 @@ def get_config() -> Config:
             "Call set_active_config(cfg) during startup before using get_config()."
         )
     return _active_config
+
+
+def _invalidate_runtime_caches() -> None:
+    embeddings_module = sys.modules.get("memory_engine.embeddings")
+    if embeddings_module is not None:
+        clear_embedding_model_cache = getattr(embeddings_module, "clear_embedding_model_cache", None)
+        if callable(clear_embedding_model_cache):
+            clear_embedding_model_cache()
+
+    retrieval_module = sys.modules.get("memory_engine.retrieval")
+    if retrieval_module is not None:
+        reset_vector_store_state = getattr(retrieval_module, "reset_vector_store_state", None)
+        if callable(reset_vector_store_state):
+            reset_vector_store_state()
+
+    tool_registry_module = sys.modules.get("memory_engine.tool_registry")
+    if tool_registry_module is not None:
+        clear_registry_prompt_cache = getattr(tool_registry_module, "clear_registry_prompt_cache", None)
+        if callable(clear_registry_prompt_cache):
+            clear_registry_prompt_cache()

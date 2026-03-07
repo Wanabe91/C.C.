@@ -13,6 +13,7 @@ from .db import (
     list_planner_runs_for_event,
     list_step_traces_for_event,
 )
+from .epistemics import epistemic_label, normalize_confidence_score, normalize_verification_status
 
 
 def _vault_root() -> Path:
@@ -207,6 +208,12 @@ def write_decision_note(fact_id: int) -> Path | None:
         "---",
         "",
         f"# {title}",
+        "",
+        "## Epistemic Status",
+        "",
+        f"- Confidence: `{normalize_confidence_score(fact.get('confidence_score')):.2f}`",
+        f"- Verification: `{normalize_verification_status(fact.get('verification_status'))}`",
+        f"- Label: `{epistemic_label(fact.get('verification_status'), fact.get('confidence_score'))}`",
         "",
         "## Decision",
         "",

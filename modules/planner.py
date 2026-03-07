@@ -8,6 +8,7 @@ from memory_engine.consolidator import run_consolidator
 from memory_engine.db import init_db
 from memory_engine.indexer import run_indexer
 from memory_engine.interrupt import InterruptChannel
+from memory_engine.llm import set_runtime_llm_config
 from memory_engine.loop import ingest_event
 from memory_engine.tool_registry import assert_registry_integrity
 
@@ -109,6 +110,7 @@ def _build_memory_engine_config(app_cfg: dict) -> Config:
 class Planner:
     def __init__(self, app_cfg: dict | None = None):
         self.app_cfg = app_cfg or {}
+        set_runtime_llm_config(self.app_cfg)
         memory_cfg = _build_memory_engine_config(self.app_cfg)
         set_active_config(memory_cfg)
         assert_registry_integrity()

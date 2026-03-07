@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import logging
 from dataclasses import dataclass, field
@@ -21,6 +22,7 @@ CONFIG_PATH = PROJECT_ROOT / "config.yaml"
 ENV_PATH = PROJECT_ROOT / ".env"
 
 load_dotenv(ENV_PATH, override=False)
+_runtime_llm_config: dict[str, Any] | None = None
 
 TASK_MODEL_MAP: dict[TaskType, str] = {
     TaskType.FAST: "groq/llama-3.3-70b-versatile",
@@ -123,6 +125,17 @@ class LLMRequest:
         else:
             messages.append({"role": "user", "content": goal or " "})
         return messages
+
+
+def set_runtime_llm_config(app_cfg: dict[str, Any] | None) -> None:
+    global _runtime_llm_config
+
+    if app_cfg is None:
+        _runtime_llm_config = None
+        return
+
+    llm_cfg = app_cfg.get("llm", {}) if isinstance(app_cfg, dict) else {}
+    _runtime_llm_config = copy.deepcopy(llm_cfg if isinstance(llm_cfg, dict) else {})
 
 
 def llm_call(
@@ -463,6 +476,8 @@ def _provider_config(provider_key: str) -> dict[str, Any]:
 
 
 def _llm_config() -> dict[str, Any]:
+    if _runtime_llm_config is not None:
+        return _runtime_llm_config
     cfg = _load_yaml_config()
     llm_cfg = cfg.get("llm", {}) if isinstance(cfg, dict) else {}
     return llm_cfg if isinstance(llm_cfg, dict) else {}

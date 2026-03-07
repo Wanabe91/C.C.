@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 import warnings
 from threading import Lock
 from typing import Any
@@ -16,13 +17,14 @@ from .db import (
     get_recent_messages,
     touch_fact_accesses,
 )
-from .embeddings import embed
+from .embeddings import embed_many
 from .models import ContextFingerprint, ContextSnapshot, Fact, FingerprintDiff, Task
 from .working_memory import working_memory
 
 _collection = None
 _collection_lock = Lock()
-_vector_store_disabled = False
+_VECTOR_STORE_RETRY_COOLDOWN_SEC = 5.0
+_vector_store_retry_after = 0.0
 _vector_store_disable_reason = ""
 logger = logging.getLogger(__name__)
 
@@ -68,7 +70,7 @@ _FTS_STOPWORDS = {
 class MemoryEmbeddingFunction:
     def __call__(self, input: Any) -> list[list[float]]:
         texts = [input] if isinstance(input, str) else list(input)
-        return [embed(text) for text in texts]
+        return embed_many([str(text) for text in texts])
 
     def embed_query(self, input: Any) -> list[list[float]]:
         return self.__call__(input)
@@ -105,17 +107,29 @@ class MemoryEmbeddingFunction:
             raise TypeError("Embedding function config must be a dict.")
 
 
-def _disable_vector_store(exc: Exception) -> None:
-    global _vector_store_disabled, _vector_store_disable_reason
+def invalidate_vector_store(exc: Exception) -> None:
+    global _collection, _vector_store_retry_after, _vector_store_disable_reason
 
-    if _vector_store_disabled:
-        return
-    _vector_store_disabled = True
-    _vector_store_disable_reason = str(exc).strip() or exc.__class__.__name__
-    logger.info(
-        "Vector store disabled; continuing without ChromaDB-backed retrieval. Reason: %s",
-        _vector_store_disable_reason,
-    )
+    reason = str(exc).strip() or exc.__class__.__name__
+    now = time.time()
+    should_log = reason != _vector_store_disable_reason or now >= _vector_store_retry_after
+    _collection = None
+    _vector_store_disable_reason = reason
+    _vector_store_retry_after = now + _VECTOR_STORE_RETRY_COOLDOWN_SEC
+    if should_log:
+        logger.warning(
+            "Vector store unavailable; retrying in %.1fs. Reason: %s",
+            _VECTOR_STORE_RETRY_COOLDOWN_SEC,
+            _vector_store_disable_reason,
+        )
+
+
+def reset_vector_store_state() -> None:
+    global _collection, _vector_store_retry_after, _vector_store_disable_reason
+
+    _collection = None
+    _vector_store_retry_after = 0.0
+    _vector_store_disable_reason = ""
 
 
 def vector_store_is_available() -> bool:
@@ -123,13 +137,13 @@ def vector_store_is_available() -> bool:
 
 
 def get_collection():
-    global _collection
-    if _vector_store_disabled:
-        return None
+    global _collection, _vector_store_retry_after, _vector_store_disable_reason
     if _collection is not None:
         return _collection
+    if time.time() < _vector_store_retry_after:
+        return None
     with _collection_lock:
-        if _vector_store_disabled:
+        if time.time() < _vector_store_retry_after:
             return None
         if _collection is None:
             config = get_config()
@@ -153,8 +167,10 @@ def get_collection():
                     metadata={"hnsw:space": "cosine"},
                     embedding_function=MemoryEmbeddingFunction(),
                 )
+                _vector_store_retry_after = 0.0
+                _vector_store_disable_reason = ""
             except Exception as exc:
-                _disable_vector_store(exc)
+                invalidate_vector_store(exc)
                 return None
     return _collection
 
@@ -201,12 +217,16 @@ def chroma_search(query: str, n: int | None = None, vector_watermark: int = 0) -
     collection = get_collection()
     if collection is None:
         return []
-    results = collection.query(
-        query_texts=[query],
-        n_results=resolved_n,
-        where={"version_created": {"$lte": vector_watermark}},
-        include=["documents", "metadatas", "distances"],
-    )
+    try:
+        results = collection.query(
+            query_texts=[query],
+            n_results=resolved_n,
+            where={"version_created": {"$lte": vector_watermark}},
+            include=["documents", "metadatas", "distances"],
+        )
+    except Exception as exc:
+        invalidate_vector_store(exc)
+        return []
     metadatas = (results.get("metadatas") or [[]])[0]
     ordered_fact_ids: list[int] = []
     seen: set[int] = set()
@@ -257,7 +277,7 @@ def get_pinned_facts(conn) -> list[Fact]:
         FROM facts
         WHERE status = 'active'
           AND json_extract(meta_json, '$.kind') IN ('user_model', 'preference')
-        ORDER BY importance DESC, last_accessed_at DESC
+        ORDER BY importance DESC, COALESCE(confidence_score, 0) DESC, last_accessed_at DESC
         """
     ).fetchall()
     return [_fact_from_row(row) for row in rows if row is not None]

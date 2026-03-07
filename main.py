@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import logging
 import time
 
 import yaml
@@ -13,16 +14,23 @@ from modules.tts import TextToSpeech
 from modules.planner import Planner
 from modules.vision import VisionModule
 
+logger = logging.getLogger(__name__)
+
 
 class PersonalAI:
     def __init__(self, config):
         self.config = config if isinstance(config, dict) else {}
-        self.planner = Planner(config)
+        self.planner = None
 
         # Text mode works without optional voice/vision modules.
         self.tts = self._build_tts(config)
         self.stt = None
         self.vision = None
+
+    def _ensure_planner(self):
+        if self.planner is None:
+            self.planner = Planner(self.config)
+        return self.planner
 
     @staticmethod
     def _build_tts(config):
@@ -36,8 +44,7 @@ class PersonalAI:
         try:
             return TextToSpeech(tts_cfg)
         except Exception as exc:
-            print(f"TTS disabled: {exc}")
-            return None
+            raise RuntimeError("Failed to initialize ElevenLabs TTS from config.") from exc
 
     async def _ensure_vision(self):
         if self.vision is not None:
@@ -50,7 +57,7 @@ class PersonalAI:
         return self.vision
 
     async def _on_text(self, text):
-        response = await self.planner.run(text)
+        response = await self._ensure_planner().run(text)
         await self._speak_text(response)
         return response
 
@@ -85,7 +92,8 @@ class PersonalAI:
     async def close(self):
         if self.vision is not None:
             await self.vision.close()
-        await self.planner.close()
+        if self.planner is not None:
+            await self.planner.close()
 
     async def text_mode(self):
         while True:
@@ -96,10 +104,7 @@ class PersonalAI:
                 continue
             if inp.lower() in ("exit", "\u0432\u044b\u0445\u043e\u0434"):
                 break
-            try:
-                print(f"AI: {await self._on_text(inp)}\n")
-            except Exception as exc:
-                print(f"Error: {exc}\n")
+            print(f"AI: {await self._on_text(inp)}\n")
 
     async def vision_mode(self):
         print("Vision mode: type a prompt for the current camera frame and press Enter.")
@@ -110,10 +115,7 @@ class PersonalAI:
                 break
             if inp.lower() in ("exit", "\u0432\u044b\u0445\u043e\u0434"):
                 break
-            try:
-                print(f"AI: {await self._on_frame(inp)}\n")
-            except Exception as exc:
-                print(f"Error: {exc}\n")
+            print(f"AI: {await self._on_frame(inp)}\n")
 
     async def vision_stream_mode(self):
         vision = await self._ensure_vision()
@@ -151,13 +153,9 @@ class PersonalAI:
                     last_status_at = now
 
                 if pending_llm_task is not None and pending_llm_task.done():
-                    try:
-                        result = pending_llm_task.result()
-                    except Exception as exc:
-                        print(f"[GPT-4o] Error: {exc}")
-                    else:
-                        print(f"[GPT-4o] {result.response}\n")
-                        await self._speak_text(result.response)
+                    result = pending_llm_task.result()
+                    print(f"[GPT-4o] {result.response}\n")
+                    await self._speak_text(result.response)
                     pending_llm_task = None
 
                 await asyncio.sleep(vision.frame_interval_ms / 1000)
@@ -168,11 +166,13 @@ class PersonalAI:
 
 
 async def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["text", "voice", "vision", "vision-stream"], default="text")
     parser.add_argument("--config", default="config.yaml")
     args = parser.parse_args()
 
+    logger.info("Starting PersonalAI mode=%s config=%s", args.mode, args.config)
     with open(args.config, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 

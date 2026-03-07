@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any
@@ -8,6 +9,8 @@ try:
     from ultralytics import YOLO
 except ImportError:  # pragma: no cover - dependency availability depends on the local environment.
     YOLO = None
+
+logger = logging.getLogger(__name__)
 
 
 def _coerce_bool(value: Any, default: bool) -> bool:
@@ -68,14 +71,23 @@ class MachineVisionModule:
         self._model: Any | None = None
 
     def _ensure_model(self) -> Any:
-        if not self.enabled:
+        if not self.requested:
             return None
+        if YOLO is None:
+            raise RuntimeError(
+                "Machine vision is enabled but ultralytics is not installed. "
+                "Install the dependency or disable machine_vision_enabled."
+            )
+        if not self.model_name:
+            raise RuntimeError(
+                "Machine vision is enabled but no model name was configured."
+            )
         if self._model is None:
             self._model = YOLO(self.model_name)
         return self._model
 
     def analyze_frame(self, frame: Any) -> MachineVisionResult:
-        if not self.enabled:
+        if not self.requested:
             return MachineVisionResult(
                 enabled=False,
                 model_name=self.model_name,
@@ -91,13 +103,11 @@ class MachineVisionModule:
                 max_det=self.max_detections,
                 verbose=False,
             )[0]
-        except Exception:
-            return MachineVisionResult(
-                enabled=False,
-                model_name=self.model_name,
-                summary="",
-                detections=(),
-            )
+        except Exception as exc:
+            logger.exception("Machine vision inference failed for model=%s", self.model_name or "<unset>")
+            raise RuntimeError(
+                f"Machine vision inference failed for model '{self.model_name or '<unset>'}'."
+            ) from exc
 
         names = prediction.names
         raw_boxes = getattr(prediction, "boxes", None)

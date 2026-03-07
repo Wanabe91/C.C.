@@ -28,6 +28,12 @@ class Fact:
     created_at: float | None = None
     last_accessed_at: float | None = None
     access_count: int = 0
+    confidence_score: float = 0.20
+    verification_status: str = "unverified"
+    verification_count: int = 0
+    last_verified_at: float | None = None
+    evidence: list[dict[str, Any]] | None = None
+    contradiction_group_id: str | None = None
     meta: dict[str, Any] | None = None
 
 

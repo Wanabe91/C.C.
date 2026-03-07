@@ -12,7 +12,7 @@ from .db import (
     recompute_vector_watermark,
 )
 from .embeddings import embed
-from .retrieval import get_collection
+from .retrieval import get_collection, invalidate_vector_store
 
 logger = logging.getLogger(__name__)
 
@@ -46,23 +46,31 @@ async def run_indexer(stop_event: asyncio.Event) -> None:
         try:
             collection = get_collection()
             if collection is None:
-                _mark_outbox_complete(outbox_id)
+                mark_outbox_failed(outbox_id)
+                await _wait_or_stop(stop_event, config.INDEXER_POLL_INTERVAL_SEC)
                 continue
             vector = embed(fact.content)
             metadata = {
                 "fact_id": fact.id,
                 "version_created": fact.version_created,
                 "status": fact.status,
+                "confidence_score": fact.confidence_score,
+                "verification_status": fact.verification_status,
             }
             if fact.source_event_id is not None:
                 metadata["source_event_id"] = fact.source_event_id
-            collection.upsert(
-                ids=[fact.embedding_id or f"fact:{fact.id}"],
-                embeddings=[vector],
-                documents=[fact.content],
-                metadatas=[metadata],
-            )
+            try:
+                collection.upsert(
+                    ids=[fact.embedding_id or f"fact:{fact.id}"],
+                    embeddings=[vector],
+                    documents=[fact.content],
+                    metadatas=[metadata],
+                )
+            except Exception as exc:
+                invalidate_vector_store(exc)
+                raise
             _mark_outbox_complete(outbox_id)
         except Exception:
             logger.exception("Indexer failed to embed or upsert fact %s", item["fact_id"])
             mark_outbox_failed(outbox_id)
+            await _wait_or_stop(stop_event, config.INDEXER_POLL_INTERVAL_SEC)

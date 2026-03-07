@@ -79,8 +79,10 @@ If no changes are needed, return: { "proposals": [] }
 3. NEVER produce a merge where merged_content loses specific detail present in any source fact.
    If in doubt, do not merge.
 4. source_tier_after for merge proposals must always be "cold", never "archived".
-5. Maximum 5 proposals per call.
-6. reasoning must be one sentence, no longer.
+5. access_count and last_accessed_at are salience signals only, not proof of truth.
+6. NEVER merge facts marked contradicted or facts from different contradiction groups.
+7. Maximum 5 proposals per call.
+8. reasoning must be one sentence, no longer.
 """.strip()
 
 TIERING_RESPONSE_SCHEMA = {
@@ -122,6 +124,11 @@ def _fact_payload(fact: Fact) -> dict[str, Any]:
         "created_at": _fact_timestamp(fact.created_at),
         "last_accessed_at": _fact_timestamp(fact.last_accessed_at),
         "access_count": fact.access_count,
+        "confidence_score": fact.confidence_score,
+        "verification_status": fact.verification_status,
+        "verification_count": fact.verification_count,
+        "last_verified_at": _fact_timestamp(fact.last_verified_at),
+        "contradiction_group_id": fact.contradiction_group_id,
     }
 
 
@@ -217,7 +224,12 @@ def _tiering_user_prompt(facts: list[Fact]) -> str:
         "- tier (active | cold)\n"
         "- created_at\n"
         "- last_accessed_at\n"
-        "- access_count\n\n"
+        "- access_count\n"
+        "- confidence_score\n"
+        "- verification_status\n"
+        "- verification_count\n"
+        "- last_verified_at\n"
+        "- contradiction_group_id\n\n"
         "Apply the rules strictly. Return only JSON."
     )
 
@@ -278,6 +290,15 @@ def _normalize_merge_proposal(proposal: dict[str, Any], facts_by_id: dict[int, F
     if len(normalized_ids) < 2:
         return None
     if any(facts_by_id[fact_id].tier != "active" for fact_id in normalized_ids):
+        return None
+    if any(facts_by_id[fact_id].verification_status == "contradicted" for fact_id in normalized_ids):
+        return None
+    contradiction_groups = {
+        facts_by_id[fact_id].contradiction_group_id
+        for fact_id in normalized_ids
+        if facts_by_id[fact_id].contradiction_group_id
+    }
+    if len(contradiction_groups) > 1:
         return None
     merged_content = str(proposal.get("merged_content") or "").strip()
     merged_importance = str(proposal.get("merged_importance") or "").strip().lower()

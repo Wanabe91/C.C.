@@ -11,6 +11,7 @@ from .consolidator import run_consolidator
 from .db import init_db
 from .indexer import run_indexer
 from .interrupt import InterruptChannel
+from .llm import set_runtime_llm_config
 from .loop import ingest_event
 from .tool_registry import assert_registry_integrity
 
@@ -67,6 +68,7 @@ async def _shutdown_workers(workers: list[asyncio.Task]) -> None:
 
 async def start() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    set_runtime_llm_config(None)
     cfg = load_config_from_env()
     set_active_config(cfg)
     assert_registry_integrity()

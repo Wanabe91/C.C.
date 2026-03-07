@@ -9,6 +9,8 @@ from typing import Any, Callable
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 from .config import get_config
+from .db import get_fact_by_id, record_fact_verification
+from .epistemics import remembered_fact_epistemics
 from .identity import CORE
 from .weekly_review import generate_weekly_review
 from .working_memory import working_memory
@@ -61,6 +63,36 @@ class CreateTaskArgs(ToolArgsModel):
     def _ensure_title(self) -> "CreateTaskArgs":
         if not self.title:
             raise ValueError("title must not be empty.")
+        return self
+
+
+class VerifyFactArgs(ToolArgsModel):
+    fact_id: str | int
+    method: str
+    source_ref: str | None = None
+    note: str | None = None
+    contradiction_group_id: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_args(self) -> "VerifyFactArgs":
+        normalized_fact_id = str(self.fact_id).strip()
+        if not normalized_fact_id or not normalized_fact_id.isdigit():
+            raise ValueError("fact_id must be a numeric string.")
+        self.fact_id = normalized_fact_id
+
+        normalized_method = str(self.method or "").strip().lower()
+        if normalized_method not in {"user_confirmed", "external_match", "logical_consistency", "contradicted"}:
+            raise ValueError(
+                "method must be one of: user_confirmed, external_match, logical_consistency, contradicted."
+            )
+        self.method = normalized_method
+        self.source_ref = self.source_ref.strip() if self.source_ref is not None else None
+        self.note = self.note.strip() if self.note is not None else None
+        self.contradiction_group_id = (
+            self.contradiction_group_id.strip()
+            if self.contradiction_group_id is not None
+            else None
+        )
         return self
 
 
@@ -166,11 +198,16 @@ def _handle_remember_fact(args: RememberFactArgs) -> dict[str, Any]:
         return result
     meta = dict(args.meta or {})
     meta["kind"] = kind
+    verification_status, confidence_score, evidence = remembered_fact_epistemics(meta)
     result["facts"] = [
         {
             "content": args.content,
             "importance": args.importance,
             "tier": args.tier,
+            "confidence_score": confidence_score,
+            "verification_status": verification_status,
+            "verification_count": 1,
+            "evidence": evidence,
             "meta": meta,
         }
     ]
@@ -185,6 +222,33 @@ def _handle_create_task(args: CreateTaskArgs) -> dict[str, Any]:
             "constraint_json": dict(args.constraint_json) if args.constraint_json is not None else None,
         }
     ]
+    return result
+
+
+def _handle_verify_fact(args: VerifyFactArgs) -> dict[str, Any]:
+    result = _base_result("verify_fact")
+    fact_id = int(args.fact_id)
+    updated = record_fact_verification(
+        fact_id,
+        method=args.method,
+        source_ref=args.source_ref,
+        note=args.note,
+        contradiction_group_id=args.contradiction_group_id,
+    )
+    if not updated:
+        result["status"] = "error"
+        result["assistant_message"] = f"Fact {fact_id} was not found for verification."
+        return result
+
+    fact = get_fact_by_id(fact_id)
+    if fact is not None:
+        result["tool_output"] = {
+            "fact_id": fact.id,
+            "verification_status": fact.verification_status,
+            "confidence_score": fact.confidence_score,
+            "verification_count": fact.verification_count,
+            "contradiction_group_id": fact.contradiction_group_id,
+        }
     return result
 
 
@@ -279,7 +343,8 @@ TOOL_REGISTRY: dict[str, ToolDefinition] = {
             'to remember, save, store, or not forget durable information. '
             'If the user also wants a reply, use remember_fact before respond. '
             'Args: {"content": "fact to store", '
-            '"importance": "core|contextual|transient"?, "tier": "active|cold|archived"?, "meta": {...}?}'
+            '"importance": "core|contextual|transient"?, "tier": "active|cold|archived"?, "meta": {...}?}. '
+            "Facts captured through this tool start as self-reported memory, not externally verified truth."
         ),
     ),
     "create_task": ToolDefinition(
@@ -287,6 +352,19 @@ TOOL_REGISTRY: dict[str, ToolDefinition] = {
         args_schema=CreateTaskArgs,
         handler=_handle_create_task,
         planner_hint='Create a follow-up task. Args: {"title": "task title", "description": "optional detail"?}',
+    ),
+    "verify_fact": ToolDefinition(
+        name="verify_fact",
+        args_schema=VerifyFactArgs,
+        handler=_handle_verify_fact,
+        planner_hint=(
+            'Update the epistemic status of an existing fact when the user confirms it, an external source '
+            'matches it, a consistency check passes, or a contradiction is detected. '
+            'Args: {"fact_id": "numeric id", "method": '
+            '"user_confirmed|external_match|logical_consistency|contradicted", '
+            '"source_ref": "optional citation", "note": "optional note", '
+            '"contradiction_group_id": "optional shared conflict id"}'
+        ),
     ),
     "complete_task": ToolDefinition(
         name="complete_task",
@@ -349,6 +427,10 @@ def registry_prompt_block() -> str:
     for tool_definition in TOOL_REGISTRY.values():
         lines.append(f"- {tool_definition.name}: {tool_definition.planner_hint}")
     return "\n".join(lines)
+
+
+def clear_registry_prompt_cache() -> None:
+    registry_prompt_block.cache_clear()
 
 
 def assert_registry_integrity() -> None:

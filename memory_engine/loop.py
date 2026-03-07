@@ -30,6 +30,7 @@ from .db import (
     list_pending_consolidation_proposals,
     persist_result,
 )
+from .epistemics import normalize_confidence_score, weaker_verification_status
 from .executor import execute_step, revalidate
 from .interrupt import InterruptChannel
 from .llm import llm_call
@@ -346,6 +347,55 @@ def _archive_source_meta(meta: dict[str, Any] | None, *, proposal_id: int, versi
     return updated
 
 
+def _merged_fact_epistemics(source_facts: list[Any]) -> dict[str, Any]:
+    if not source_facts:
+        return {
+            "confidence_score": 0.20,
+            "verification_status": "unverified",
+            "verification_count": 0,
+            "last_verified_at": None,
+            "contradiction_group_id": None,
+            "evidence": [],
+        }
+
+    weakest_status = source_facts[0].verification_status
+    min_confidence = normalize_confidence_score(source_facts[0].confidence_score, fallback=0.20)
+    verification_count = source_facts[0].verification_count
+    last_verified_candidates = [
+        float(fact.last_verified_at)
+        for fact in source_facts
+        if fact.last_verified_at is not None
+    ]
+    contradiction_groups = {
+        fact.contradiction_group_id
+        for fact in source_facts
+        if fact.contradiction_group_id
+    }
+    evidence = [
+        {
+            "kind": "derived_merge",
+            "method": "consolidation_merge",
+            "source_fact_ids": [fact.id for fact in source_facts],
+            "note": "Derived by consolidation from existing source facts without increasing confidence.",
+        }
+    ]
+    for fact in source_facts[1:]:
+        weakest_status = weaker_verification_status(weakest_status, fact.verification_status)
+        min_confidence = min(
+            min_confidence,
+            normalize_confidence_score(fact.confidence_score, fallback=0.20),
+        )
+        verification_count = min(verification_count, fact.verification_count)
+    return {
+        "confidence_score": min_confidence,
+        "verification_status": weakest_status,
+        "verification_count": verification_count,
+        "last_verified_at": min(last_verified_candidates) if last_verified_candidates else None,
+        "contradiction_group_id": next(iter(contradiction_groups), None),
+        "evidence": evidence,
+    }
+
+
 def _apply_merge_proposal(conn: Any, proposal_record: dict[str, Any], proposal: dict[str, Any], version: int) -> bool:
     try:
         normalized_ids = _normalize_source_fact_ids(proposal.get("source_fact_ids"))
@@ -366,6 +416,16 @@ def _apply_merge_proposal(conn: Any, proposal_record: dict[str, Any], proposal: 
     if any(by_id[fid].status != "active" or by_id[fid].tier != "active" for fid in normalized_ids):
         _reject_proposal(conn, proposal_record["id"])
         return False
+    if any(by_id[fid].verification_status == "contradicted" for fid in normalized_ids):
+        _reject_proposal(conn, proposal_record["id"], reason="contradicted_fact_protected", proposal=proposal)
+        return False
+
+    source_facts = [by_id[fact_id] for fact_id in normalized_ids]
+    contradiction_groups = {fact.contradiction_group_id for fact in source_facts if fact.contradiction_group_id}
+    if len(contradiction_groups) > 1:
+        _reject_proposal(conn, proposal_record["id"], reason="conflicting_contradiction_groups", proposal=proposal)
+        return False
+    epistemics = _merged_fact_epistemics(source_facts)
 
     merged_fact_id = insert_fact(
         conn,
@@ -373,6 +433,12 @@ def _apply_merge_proposal(conn: Any, proposal_record: dict[str, Any], proposal: 
             "content": merged_content,
             "importance": _normalize_importance(proposal.get("merged_importance")),
             "tier": "active",
+            "confidence_score": epistemics["confidence_score"],
+            "verification_status": epistemics["verification_status"],
+            "verification_count": epistemics["verification_count"],
+            "last_verified_at": epistemics["last_verified_at"],
+            "evidence": epistemics["evidence"],
+            "contradiction_group_id": epistemics["contradiction_group_id"],
             "meta": {
                 "merged_from": normalized_ids,
                 "merge_source_proposal_id": proposal_record["id"],
@@ -712,7 +778,6 @@ async def _execute_and_persist(
     planner_run_id: int,
     snapshot: ContextSnapshot,
     step_index: int,
-    fact_version: int,
     decision_fact_ids: list[int],
     generated_reviews: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -751,6 +816,9 @@ async def _execute_and_persist(
     )
     with db_transaction() as conn:
         persist_result(conn, result, event_id)
+        # Resolve the fact version at persist time so later steps in the same event
+        # cannot reuse a version whose watermark has already advanced.
+        fact_version = _get_state_version(conn)
         created_fact_ids: list[int] = []
         for fact in extract_facts_from_result(result):
             fact["source_event_id"] = event_id
@@ -843,7 +911,6 @@ async def ingest_event(
                 planner_run_id=planner_run_id,
                 snapshot=snapshot,
                 step_index=iteration,
-                fact_version=V,
                 decision_fact_ids=decision_fact_ids,
                 generated_reviews=generated_reviews,
             )

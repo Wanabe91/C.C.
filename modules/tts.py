@@ -11,7 +11,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from elevenlabs.client import ElevenLabs
+try:
+    from elevenlabs.client import ElevenLabs
+except ImportError:  # pragma: no cover - dependency availability depends on the local environment.
+    ElevenLabs = None
 
 
 @dataclass(slots=True)
@@ -37,6 +40,10 @@ def _parse_optional_int(value: str | None) -> int | None:
 class TextToSpeech:
     def __init__(self, config: dict[str, Any] | None = None):
         cfg = config or {}
+        if ElevenLabs is None:
+            raise RuntimeError(
+                "elevenlabs SDK is not installed. Install it or disable tts.enabled."
+            )
         api_key = str(cfg.get("api_key") or os.getenv("ELEVENLABS_API_KEY") or "").strip()
         if not api_key:
             raise RuntimeError("ELEVENLABS_API_KEY is not set.")

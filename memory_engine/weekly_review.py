@@ -12,6 +12,7 @@ from .db import (
     list_tasks_completed_between,
     list_tasks_created_between,
 )
+from .epistemics import epistemic_label, normalize_confidence_score, normalize_verification_status
 
 
 def _local_today() -> date:
@@ -58,6 +59,13 @@ def _count_messages_by_role(messages: list[dict[str, Any]], role: str) -> int:
     return sum(message.get("role") == role for message in messages)
 
 
+def _fact_epistemic_line(fact: dict[str, Any]) -> str:
+    content = str(fact.get("content") or "").strip()
+    status = normalize_verification_status(fact.get("verification_status"))
+    score = normalize_confidence_score(fact.get("confidence_score"))
+    return f"- [{epistemic_label(status, score)}] {content}"
+
+
 def generate_weekly_review(args: dict[str, Any] | None = None) -> dict[str, Any]:
     args = args or {}
     week_start = _coerce_week_start(args)
@@ -81,6 +89,21 @@ def generate_weekly_review(args: dict[str, Any] | None = None) -> dict[str, Any]
     focus = str(args.get("focus") or "").strip()
     user_message_count = _count_messages_by_role(messages, "user")
     assistant_message_count = _count_messages_by_role(messages, "assistant")
+    verified_facts = [
+        fact
+        for fact in facts
+        if normalize_verification_status(fact.get("verification_status"))
+        in {"user_confirmed", "externally_confirmed", "logically_consistent"}
+    ]
+    tentative_facts = [
+        fact
+        for fact in facts
+        if normalize_verification_status(fact.get("verification_status"))
+        in {"unverified", "self_reported"}
+    ]
+    contradicted_facts = [
+        fact for fact in facts if normalize_verification_status(fact.get("verification_status")) == "contradicted"
+    ]
 
     recent_user_messages = [
         str(message["content"]).strip()
@@ -98,6 +121,9 @@ def generate_weekly_review(args: dict[str, Any] | None = None) -> dict[str, Any]
         "planner_fallback_runs": planner_activity["fallback_count"],
         "planner_rejections": planner_activity["rejections"],
         "facts_captured": len(facts),
+        "facts_verified": len(verified_facts),
+        "facts_tentative": len(tentative_facts),
+        "facts_contradicted": len(contradicted_facts),
         "decisions_logged": len(decisions),
         "tasks_created": len(tasks_created),
         "tasks_completed": len(tasks_completed),
@@ -117,6 +143,9 @@ def generate_weekly_review(args: dict[str, Any] | None = None) -> dict[str, Any]
         f"- Planner repairs: `{planner_activity['repaired_count']}`",
         f"- Planner fallbacks: `{planner_activity['fallback_count']}`",
         f"- Facts captured: `{len(facts)}`",
+        f"- Verified facts: `{len(verified_facts)}`",
+        f"- Tentative facts: `{len(tentative_facts)}`",
+        f"- Contradicted facts: `{len(contradicted_facts)}`",
         f"- Decisions logged: `{len(decisions)}`",
         f"- Tasks created: `{len(tasks_created)}`",
         f"- Tasks completed: `{len(tasks_completed)}`",
@@ -142,7 +171,7 @@ def generate_weekly_review(args: dict[str, Any] | None = None) -> dict[str, Any]
     if general_facts:
         lines.extend(
             [
-                f"- {str(fact.get('content') or '').strip()}"
+                _fact_epistemic_line(fact)
                 for fact in general_facts[:10]
                 if str(fact.get("content") or "").strip()
             ]
